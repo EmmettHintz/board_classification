@@ -1,4 +1,5 @@
-# Chess Board Recognition for Mac
+# Chess Board Recognition
+- Emmett Hintz, Tajveer Singh, Zach Amendola
 
 This project provides an end-to-end pipeline for:
 1. Processing chess board diagrams from PDFs
