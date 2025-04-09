@@ -36,7 +36,7 @@ brew install poppler
 ### Step 3: Set up Python environment (recommended)
 ```bash
 # Create a virtual environment
-python -m venv venv
+python3.10 -m venv venv
 
 # Activate the environment
 source venv/bin/activate
