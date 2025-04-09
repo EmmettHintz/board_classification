@@ -82,6 +82,3 @@ If you encounter PDF conversion issues:
 ### Performance Optimization
 - For better performance, consider reducing the DPI value in the `pdf_to_image` function
 - If processing large batches, consider increasing batch size for model inference
-
-## License
-This project is provided for educational purposes only.# board_classification
