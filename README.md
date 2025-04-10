@@ -9,7 +9,7 @@ The goal of this project is to provide an end-to-end pipeline for:
 
 Work done so far:
 1. Drawing chess boards with pieces represented by their first letter and a subscript to denote piece color
-- Zach and Tajveer (50 boards drawn each)
+    - Zach and Tajveer (50 boards drawn each)
 2. Scanning and uploading chess boards
-- Zach and Tajveer (50 boards scanned each)
+    - Zach and Tajveer (50 boards scanned each)
 3. ...
