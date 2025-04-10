@@ -31,6 +31,7 @@ from datetime import datetime
 import json
 import platform
 import sys
+import io
 
 
 # Check TensorFlow version and GPU availability
@@ -83,7 +84,7 @@ and segment it into individual squares.
 """
 
 
-def pdf_to_image(pdf_path, dpi=300):
+def pdf_to_image(pdf_path, dpi=200):
     """
     Convert the first page of a PDF to a high-resolution image.
     Mac-optimized version uses pdf2image.
@@ -95,6 +96,7 @@ def pdf_to_image(pdf_path, dpi=300):
     Returns:
         NumPy array containing the image
     """
+    print(f"  Converting PDF to image... ", end="", flush=True)
     try:
         # For Mac, we need to handle poppler path differently
         if platform.system() == "Darwin":  # macOS
@@ -102,11 +104,11 @@ def pdf_to_image(pdf_path, dpi=300):
             try:
                 pages = convert_from_path(pdf_path, dpi=dpi)
             except Exception as e:
-                print(f"Standard PDF conversion failed: {e}")
+                print(f"\n  Standard PDF conversion failed: {e}")
                 # If homebrew is installed, poppler might be here
                 poppler_path = "/opt/homebrew/bin"
                 if os.path.exists(poppler_path):
-                    print(f"Trying with poppler path: {poppler_path}")
+                    print(f"  Trying with poppler path: {poppler_path}")
                     pages = convert_from_path(
                         pdf_path, dpi=dpi, poppler_path=poppler_path
                     )
@@ -120,16 +122,17 @@ def pdf_to_image(pdf_path, dpi=300):
 
         # Use the first page
         image = np.array(pages[0])
+        print("done")
         return image
     except Exception as e:
-        print(f"Error converting PDF to image: {e}")
+        print(f"failed: {e}")
         print("If on Mac, make sure poppler is installed: brew install poppler")
         return None
 
 
 def preprocess_board_image(image):
     """
-    Preprocess the chess board image to enhance features.
+    Preprocess the chess board image to enhance features and handle messy grid lines.
 
     Args:
         image: The input chess board image
@@ -143,25 +146,47 @@ def preprocess_board_image(image):
     else:
         gray = image.copy()
 
-    # Apply contrast enhancement
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # Apply contrast enhancement with adaptive CLAHE
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+    enhanced = clahe.apply(blurred)
 
-    # Apply adaptive thresholding to handle varying lighting conditions
-    binary = cv2.adaptiveThreshold(
+    # Try different thresholding approaches and select the best one
+    # 1. Adaptive thresholding
+    binary_adaptive = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
     )
+    
+    # 2. Otsu's thresholding
+    _, binary_otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Combine both thresholding methods for better results
+    binary = cv2.bitwise_or(binary_adaptive, binary_otsu)
+    
+    # Morphological operations to clean up the image
+    # Create a small kernel for noise removal
+    kernel_small = np.ones((2, 2), np.uint8)
+    # Create a larger kernel for connecting components
+    kernel_large = np.ones((3, 3), np.uint8)
+    
+    # Remove small noise
+    denoised = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small)
+    
+    # Connect nearby components that might be broken
+    dilated = cv2.dilate(denoised, kernel_large, iterations=1)
+    
+    # Use closing to fill small holes
+    closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel_large)
 
-    # Dilate to connect components
-    kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(binary, kernel, iterations=1)
-
-    return dilated, enhanced
+    return closed, enhanced
 
 
 def find_board_contour(image):
     """
-    Detect the main chess board contour in the image.
+    Detect the main chess board contour in the image with enhanced robustness
+    for messy or skewed boards.
 
     Args:
         image: Preprocessed binary image
@@ -170,20 +195,62 @@ def find_board_contour(image):
         Contour of the chessboard
     """
     # Find contours in the image
-    contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Sort contours by area in descending order and get the largest
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    contours, hierarchy = cv2.findContours(image, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         raise ValueError("No contours found in the image")
 
-    # The largest contour is likely the chessboard
-    board_contour = contours[0]
+    # Sort contours by area in descending order
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    # Initialize best_contour with the largest contour
+    best_contour = contours[0]
+    
+    # Look for a contour that's closer to a square/rectangle shape
+    # This helps with boards that have grid lines that might create irregular contours
+    best_score = float('inf')
+    
+    # Check several of the largest contours
+    for contour in contours[:min(5, len(contours))]:
+        # Skip very small contours
+        if cv2.contourArea(contour) < 0.3 * cv2.contourArea(contours[0]):
+            continue
+            
+        # Calculate bounding rectangle
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect)
+        box = np.int32(box)  # Changed from np.int0 to np.int32
+        rect_area = cv2.contourArea(box)
+        
+        # Calculate shape regularity (how close to rectangular)
+        contour_area = cv2.contourArea(contour)
+        if rect_area > 0:
+            area_score = abs(1.0 - contour_area / rect_area)
+            
+            # Check if the perimeter-to-area ratio is reasonable
+            perimeter = cv2.arcLength(contour, True)
+            if contour_area > 0:
+                compactness = perimeter * perimeter / contour_area
+                
+                # For a perfect square, this value is about 16
+                compactness_score = abs(16 - compactness)
+                
+                # Combine scores
+                score = area_score + 0.1 * compactness_score
+                
+                if score < best_score:
+                    best_score = score
+                    best_contour = contour
 
     # Approximate the contour to get a cleaner polygon
-    epsilon = 0.02 * cv2.arcLength(board_contour, True)
-    approx_board = cv2.approxPolyDP(board_contour, epsilon, True)
+    epsilon = 0.02 * cv2.arcLength(best_contour, True)
+    approx_board = cv2.approxPolyDP(best_contour, epsilon, True)
+    
+    # If our approximation doesn't have 4 points, use the minimum area rectangle
+    if len(approx_board) != 4:
+        rect = cv2.minAreaRect(best_contour)
+        approx_board = cv2.boxPoints(rect)
+        approx_board = np.int32(approx_board)  # Changed from np.int0 to np.int32
 
     return approx_board
 
@@ -191,6 +258,7 @@ def find_board_contour(image):
 def get_board_corners(contour, original_image):
     """
     Get the four corners of the chessboard from its contour.
+    Uses the simpler, faster method that was working previously.
 
     Args:
         contour: Chessboard contour
@@ -210,7 +278,7 @@ def get_board_corners(contour, original_image):
     # Sort corners to be in the order: top-left, top-right, bottom-right, bottom-left
     # First, compute center of contour
     center = np.mean(corners, axis=0)
-
+    
     # Function to sort corners
     def sort_corners(corners, center):
         # Calculate the angles
@@ -222,10 +290,10 @@ def get_board_corners(contour, original_image):
         if sorted_corners[0][1] > center[1]:  # If y is below center
             sorted_corners = np.roll(sorted_corners, -1, axis=0)
         return sorted_corners
-
+        
     corners = sort_corners(corners, center)
-
-    # Optional: Debug image with corners marked -- remove if this gets annoying
+    
+    # Debug image with corners marked
     debug_img = original_image.copy()
     for i, corner in enumerate(corners):
         cv2.circle(debug_img, tuple(corner), 15, (0, 255, 0), -1)
@@ -273,7 +341,8 @@ def perspective_transform(image, corners):
 
 def segment_chessboard(warped_image):
     """
-    Segment the chessboard into 64 individual squares.
+    Segment the chessboard into 64 individual squares with enhanced robustness
+    for messy or uneven grid lines.
 
     Args:
         warped_image: Warped chessboard image
@@ -282,52 +351,213 @@ def segment_chessboard(warped_image):
         8x8 grid of square images
     """
     height, width = warped_image.shape[:2]
-    square_size = height // 8
-
+    
+    # Try to detect actual grid lines
+    if len(warped_image.shape) == 3:
+        gray = cv2.cvtColor(warped_image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = warped_image.copy()
+    
+    # Apply adaptive thresholding to find grid lines
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+    
+    # Use morphology to enhance horizontal and vertical lines
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (width//16, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, height//16))
+    
+    # Detect horizontal lines
+    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+    horizontal_lines = cv2.dilate(horizontal_lines, horizontal_kernel, iterations=1)
+    
+    # Detect vertical lines
+    vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
+    vertical_lines = cv2.dilate(vertical_lines, vertical_kernel, iterations=1)
+    
+    # Combine the lines
+    grid_lines = cv2.bitwise_or(horizontal_lines, vertical_lines)
+    
+    # Function to find the most likely grid line positions
+    def find_grid_lines(lines_image, axis=0):
+        # For horizontal lines, axis=0 (project onto y-axis)
+        # For vertical lines, axis=1 (project onto x-axis)
+        projection = np.sum(lines_image, axis=axis)
+        
+        # Find peaks in the projection (likely grid positions)
+        peak_threshold = np.max(projection) * 0.3  # Adjust threshold as needed
+        peaks = []
+        
+        for i in range(1, len(projection) - 1):
+            if (projection[i] > projection[i-1] and 
+                projection[i] > projection[i+1] and 
+                projection[i] > peak_threshold):
+                peaks.append(i)
+        
+        # If we don't have enough peaks, use regular intervals
+        if len(peaks) < 9:  # We need 9 grid lines (8 cells + boundaries)
+            return np.linspace(0, lines_image.shape[1-axis] - 1, 9).astype(int), projection, []
+        
+        # Sort peaks and select the most prominent ones
+        peaks.sort()
+        original_peaks = peaks.copy()
+        
+        # If too many peaks, select the most evenly spaced ones
+        if len(peaks) > 9:
+            # Start with the first and last peaks (board boundaries)
+            selected_peaks = [peaks[0], peaks[-1]]
+            
+            # Calculate average spacing
+            avg_spacing = (peaks[-1] - peaks[0]) / 8
+            
+            # Try to find peaks at expected positions
+            for i in range(1, 8):
+                expected_pos = peaks[0] + i * avg_spacing
+                best_peak = None
+                min_distance = float('inf')
+                
+                for peak in peaks[1:-1]:  # Skip first and last which we already selected
+                    if peak not in selected_peaks:
+                        distance = abs(peak - expected_pos)
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_peak = peak
+                
+                if best_peak is not None and min_distance < avg_spacing * 0.5:
+                    selected_peaks.append(best_peak)
+            
+            # If we still don't have enough, fill in with evenly spaced positions
+            if len(selected_peaks) < 9:
+                even_spacing = np.linspace(peaks[0], peaks[-1], 9)
+                
+                # Add missing positions
+                for i in range(1, 8):
+                    if i < len(selected_peaks) - 1:
+                        continue
+                    
+                    pos = even_spacing[i]
+                    closest_peak = None
+                    min_dist = float('inf')
+                    
+                    for peak in peaks:
+                        if peak not in selected_peaks:
+                            dist = abs(peak - pos)
+                            if dist < min_dist and dist < avg_spacing * 0.4:
+                                min_dist = dist
+                                closest_peak = peak
+                    
+                    if closest_peak is not None:
+                        selected_peaks.append(closest_peak)
+                    else:
+                        selected_peaks.append(int(pos))
+            
+            # Sort the selected peaks
+            selected_peaks.sort()
+            
+            # Ensure we have exactly 9 peaks
+            if len(selected_peaks) > 9:
+                selected_peaks = selected_peaks[:9]
+            elif len(selected_peaks) < 9:
+                # Fill remaining positions with evenly spaced points
+                missing = 9 - len(selected_peaks)
+                evenly_spaced = np.linspace(selected_peaks[0], selected_peaks[-1], 9)
+                
+                # Find positions that don't have a selected peak nearby
+                for pos in evenly_spaced:
+                    if len(selected_peaks) >= 9:
+                        break
+                    
+                    # Check if this position is not close to any existing peak
+                    if all(abs(pos - peak) > avg_spacing * 0.3 for peak in selected_peaks):
+                        selected_peaks.append(int(pos))
+                
+                # Sort again
+                selected_peaks.sort()
+                
+                # If still not enough, just use evenly spaced positions
+                if len(selected_peaks) < 9:
+                    selected_peaks = np.linspace(selected_peaks[0], selected_peaks[-1], 9).astype(int)
+            
+            return np.array(selected_peaks), projection, original_peaks
+        
+        return np.array(peaks), projection, original_peaks
+    
+    # Get grid line positions
+    row_positions, row_projection, original_row_peaks = find_grid_lines(horizontal_lines, axis=1)
+    col_positions, col_projection, original_col_peaks = find_grid_lines(vertical_lines, axis=0)
+    
+    # Ensure we have exactly 9 positions each (8 squares + boundaries)
+    if len(row_positions) != 9 or len(col_positions) != 9:
+        # Fall back to regular grid if line detection failed
+        row_positions = np.linspace(0, height - 1, 9).astype(int)
+        col_positions = np.linspace(0, width - 1, 9).astype(int)
+    
     # Create an 8x8 grid to store each square
     squares = []
-    for row in range(8):
+    for i in range(8):
         squares_row = []
-        for col in range(8):
-            # Extract the square
-            y_start = row * square_size
-            y_end = (row + 1) * square_size
-            x_start = col * square_size
-            x_end = (col + 1) * square_size
-
-            square = warped_image[y_start:y_end, x_start:x_end]
-            squares_row.append(square)
+        for j in range(8):
+            # Extract the square using detected grid lines
+            y_start = row_positions[i]
+            y_end = row_positions[i + 1]
+            x_start = col_positions[j]
+            x_end = col_positions[j + 1]
+            
+            # Ensure valid boundaries
+            y_start = max(0, y_start)
+            y_end = min(height, y_end)
+            x_start = max(0, x_start)
+            x_end = min(width, x_end)
+            
+            if y_end > y_start and x_end > x_start:
+                square = warped_image[y_start:y_end, x_start:x_end]
+                # Resize to standardize the square size
+                square = cv2.resize(square, (100, 100))
+                squares_row.append(square)
+            else:
+                # If boundaries are invalid, create an empty square
+                empty_square = np.zeros((100, 100, 3), dtype=np.uint8) if len(warped_image.shape) == 3 else np.zeros((100, 100), dtype=np.uint8)
+                squares_row.append(empty_square)
+        
         squares.append(squares_row)
-
+    
     return squares
 
 
-def process_chessboard(pdf_path, debug=False):
+def process_chessboard(pdf_path, debug=False, timeout=60):
     """
     Complete pipeline to process a chessboard from PDF to segmented squares.
 
     Args:
         pdf_path: Path to the PDF file
         debug: Whether to show debug images
+        timeout: Maximum time in seconds to spend on processing
 
     Returns:
         8x8 grid of square images
     """
+    # Use a simpler progress reporting
+    print(f"Processing chessboard from {os.path.basename(pdf_path)}:")
+    
     # Convert PDF to image
     image = pdf_to_image(pdf_path)
 
     if image is None:
-        print(f"Failed to convert PDF to image: {pdf_path}")
+        print("  Failed to convert PDF to image")
         return None
 
     # Preprocess the image
+    print("  Preprocessing image... ", end="", flush=True)
     binary, enhanced = preprocess_board_image(image)
+    print("done")
 
     # Find the board contour
     try:
+        print("  Finding board contour... ", end="", flush=True)
         board_contour = find_board_contour(binary)
+        print("done")
     except ValueError as e:
-        print(f"Error processing {pdf_path}: {e}")
+        print(f"failed: {e}")
         if debug:
             plt.figure(figsize=(10, 10))
             plt.imshow(binary, cmap="gray")
@@ -336,7 +566,9 @@ def process_chessboard(pdf_path, debug=False):
         return None
 
     # Get the corners of the board
+    print("  Detecting board corners... ", end="", flush=True)
     corners, debug_img = get_board_corners(board_contour, image)
+    print("done")
 
     if debug:
         plt.figure(figsize=(10, 10))
@@ -345,23 +577,27 @@ def process_chessboard(pdf_path, debug=False):
         plt.show()
 
     # Apply perspective transformation
+    print("  Applying perspective transform... ", end="", flush=True)
     warped = perspective_transform(enhanced, corners)
+    print("done")
 
     if debug:
         plt.figure(figsize=(8, 8))
         plt.imshow(warped, cmap="gray")
         plt.title("Warped Chessboard")
         plt.show()
-
+        
     # Segment the chessboard
+    print("  Segmenting chessboard into squares... ", end="", flush=True)
     squares = segment_chessboard(warped)
+    print("done")
 
     if debug:
         # Show a sample of squares
-        fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+        fig, axes = plt.subplots(4, 4, figsize=(12, 12))
         axes = axes.flatten()
 
-        for i in range(8):
+        for i in range(16):
             row, col = i // 4, i % 4
             square_img = squares[row][col]
             axes[i].imshow(square_img, cmap="gray")
@@ -370,7 +606,8 @@ def process_chessboard(pdf_path, debug=False):
 
         plt.tight_layout()
         plt.show()
-
+    
+    print("  Board processing complete")
     return squares
 
 
@@ -723,28 +960,72 @@ def convert_board_to_fen(predictions_matrix):
     return fen
 
 
-def process_board_with_hybrid_detection(pdf_path, debug=False):
+def process_board_with_hybrid_detection(pdf_path, debug=False, output_dir=None):
     """
     Process a chess board image and detect pieces using hybrid approach.
+    Enhanced with additional debug visualizations.
 
     Args:
         pdf_path: Path to the PDF file
         debug: Whether to show debug visualizations
+        output_dir: Directory to save debug visualizations (optional)
 
     Returns:
         FEN notation, board squares for visualization, and piece grid
     """
+    # Create output directory for debug visualizations if specified
+    if output_dir is not None and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    # Get PDF filename for saving visualizations
+    if output_dir is not None:
+        pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
+        vis_path = os.path.join(output_dir, f"{pdf_filename}_debug")
+        if not os.path.exists(vis_path):
+            os.makedirs(vis_path)
+    else:
+        vis_path = None
+        
     # Process the board to get squares
     squares = process_chessboard(pdf_path, debug=debug)
 
     if squares is None:
         return None, None, None
+    
+    # Save some sample squares if output directory is specified
+    if vis_path is not None:
+        # Save a sample of squares
+        fig, axes = plt.subplots(8, 8, figsize=(20, 20))
+        
+        for row in range(8):
+            for col in range(8):
+                square_img = squares[row][col]
+                axes[row, col].imshow(square_img, cmap="gray" if len(square_img.shape) == 2 else None)
+                axes[row, col].set_title(f"Square {row},{col}")
+                axes[row, col].axis("off")
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(vis_path, "all_squares.png"), dpi=150)
+        plt.close(fig)
 
     # Use hybrid detection to identify pieces
     piece_grid = detect_chess_pieces_hybrid(squares)
 
     # Convert to FEN notation
+    print("  Converting to FEN notation... ", end="", flush=True)
     fen = convert_board_to_fen(piece_grid)
+    print("done")
+    
+    # Save the detected board if output directory is specified
+    if vis_path is not None:
+        # Create visualization 
+        fig = visualize_board_with_predictions(squares, piece_grid, [])
+        plt.savefig(os.path.join(vis_path, "detected_board.png"), dpi=150)
+        plt.close(fig)
+        
+        # Save FEN notation
+        with open(os.path.join(vis_path, "fen.txt"), "w") as f:
+            f.write(fen)
 
     # Return the original squares and piece grid
     return fen, squares, piece_grid
@@ -905,6 +1186,8 @@ def detect_chess_pieces_hybrid(squares):
     Returns:
         8x8 grid of piece classifications in FEN notation
     """
+    print("  Detecting chess pieces... ", end="", flush=True)
+    
     # Initialize an 8x8 grid for piece classifications
     piece_grid = [["empty" for _ in range(8)] for _ in range(8)]
 
@@ -926,7 +1209,7 @@ def detect_chess_pieces_hybrid(squares):
 
         # Lower threshold to detect even faint markings
         return pixel_percentage > 0.8
-
+        
     # Function to identify the piece based on visible text
     def identify_piece(square_img):
         # Convert to grayscale if not already
@@ -953,9 +1236,7 @@ def detect_chess_pieces_hybrid(squares):
         # Filter out small noisy components
         valid_components = []
         for i in range(1, num_labels):  # Skip background label (0)
-            if (
-                stats[i, cv2.CC_STAT_AREA] > 10
-            ):  # Lower threshold to catch smaller marks
+            if stats[i, cv2.CC_STAT_AREA] > 10:  # Lower threshold to catch smaller marks
                 valid_components.append(i)
 
         if not valid_components:
@@ -963,72 +1244,98 @@ def detect_chess_pieces_hybrid(squares):
 
         # Check for subscript 'w' to determine color
         has_subscript_w = False
+        main_components = []
+        
+        # Sort components by area (largest to smallest)
+        valid_components.sort(key=lambda i: stats[i, cv2.CC_STAT_AREA], reverse=True)
+        
+        # First, identify the main component and any potential subscript 'w'
         for i in valid_components:
             # Get component's center y-position relative to image height
-            center_y = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] / 2
-            rel_y = center_y / cropped.shape[0]
-
+            component_top = stats[i, cv2.CC_STAT_TOP]
+            component_height = stats[i, cv2.CC_STAT_HEIGHT]
+            component_bottom = component_top + component_height
+            rel_bottom = component_bottom / cropped.shape[0]
+            
             # Get component's dimensions
             comp_width = stats[i, cv2.CC_STAT_WIDTH]
             comp_height = stats[i, cv2.CC_STAT_HEIGHT]
-
-            # If component is in bottom half and small, it might be a 'w'
-            if (
-                rel_y > 0.5
-                and comp_width < cropped.shape[1] / 4
-                and comp_height < cropped.shape[0] / 4
-            ):
+            comp_area = stats[i, cv2.CC_STAT_AREA]
+            comp_density = comp_area / (comp_width * comp_height) if comp_width * comp_height > 0 else 0
+            
+            # If component is in bottom portion and relatively small, it might be a 'w'
+            if (rel_bottom > 0.7 and 
+                comp_width < cropped.shape[1] / 4 and 
+                comp_height < cropped.shape[0] / 4 and
+                comp_density > 0.4):  # 'w' tends to have good fill ratio
                 has_subscript_w = True
-                break
-
-        # Find the main component (usually the largest one)
-        if len(valid_components) > 0:
-            main_component = max(
-                valid_components, key=lambda i: stats[i, cv2.CC_STAT_AREA]
-            )
-
+            else:
+                main_components.append(i)
+        
+        # If no main components remain, default to pawn
+        if not main_components:
+            piece_type = "P"
+        else:
+            # Use the largest remaining component for piece identification
+            main_component = main_components[0]
+            
             # Get shape metrics
             width = stats[main_component, cv2.CC_STAT_WIDTH]
             height = stats[main_component, cv2.CC_STAT_HEIGHT]
             area = stats[main_component, cv2.CC_STAT_AREA]
             aspect = width / height if height > 0 else 1.0
-
+            
+            # Calculate density (fill ratio)
+            density = area / (width * height) if width * height > 0 else 0
+            
             # Get relative position
-            top = stats[main_component, cv2.CC_STAT_TOP]
             left = stats[main_component, cv2.CC_STAT_LEFT]
+            top = stats[main_component, cv2.CC_STAT_TOP]
             rel_x = (left + width / 2) / cropped.shape[1]  # Relative x center
             rel_y = (top + height / 2) / cropped.shape[0]  # Relative y center
-
+            rel_area = area / (cropped.shape[0] * cropped.shape[1])  # Relative area
+            
+            # Enhanced piece type determination
             # By default, assume a pawn
             piece_type = "P"
-
-            # Look at key characteristics to determine piece type
+            
+            # Determine piece type based on shape characteristics
             if aspect > 1.2:  # Wider than tall
-                if area > 0.2 * cropped.shape[0] * cropped.shape[1]:
-                    piece_type = "K"  # Larger shapes are kings
+                if rel_area > 0.2:
+                    piece_type = "K"  # Kings tend to be larger and wider
                 else:
                     piece_type = "R"  # Rooks tend to be wide
-            elif aspect < 0.6:  # Taller than wide
-                if area < 0.05 * cropped.shape[0] * cropped.shape[1]:
-                    piece_type = "P"  # Pawns tend to be smaller
+            elif aspect < 0.7:  # Taller than wide
+                if rel_area < 0.06:
+                    piece_type = "P"  # Pawns tend to be small and slender
+                elif density > 0.6:
+                    piece_type = "Q"  # Queens often have good fill
                 else:
-                    piece_type = "Q"  # Queens tend to be taller
+                    piece_type = "B"  # Bishops can be tall and thin
             else:  # Moderate aspect ratio
-                # Look at position and size
-                if rel_y < 0.4:  # Higher in the square
-                    piece_type = "N"  # Knights tend to be higher
-                elif area > 0.1 * cropped.shape[0] * cropped.shape[1]:
-                    piece_type = "B"  # Bishops tend to be larger
+                if rel_area > 0.15:
+                    if density < 0.5:
+                        piece_type = "N"  # Knights have moderate density
+                    else:
+                        piece_type = "K"  # Could be a king
+                elif rel_area < 0.08:
+                    piece_type = "P"  # Small pieces are likely pawns
                 else:
-                    piece_type = "P"  # Default to pawn
-        else:
-            # No valid components (shouldn't happen, but just in case)
-            piece_type = "P"
+                    # Look at position and size for more clues
+                    if density > 0.6:
+                        piece_type = "Q"  # Queens tend to have high density
+                    elif density < 0.4:
+                        piece_type = "N"  # Knights have lower density
+                    else:
+                        piece_type = "B"  # Default to bishop for moderate values
 
         # Apply color based on whether we found a subscript 'w'
         return piece_type if has_subscript_w else piece_type.lower()
 
     # Process each square in the grid
+    squares_processed = 0
+    total_squares = 64
+    
     for row in range(8):
         for col in range(8):
             square_img = squares[row][col]
@@ -1037,7 +1344,13 @@ def detect_chess_pieces_hybrid(squares):
                 piece_grid[row][col] = identify_piece(square_img)
             else:
                 piece_grid[row][col] = "empty"
-
+                
+            # Update progress every 16 squares
+            squares_processed += 1
+            if squares_processed % 16 == 0:
+                print(f"{squares_processed//16}/4... ", end="", flush=True)
+    
+    print("done")
     return piece_grid
 
 
@@ -1052,7 +1365,7 @@ def main():
     running_in_notebook = "ipykernel" in sys.modules
 
     print("=" * 50)
-    print("Chess Board Recognition - Mac Optimized")
+    print("Chess Board Recognition - Enhanced for Messy Boards")
     print("=" * 50)
 
     # Check if there are PDF files to process
@@ -1060,13 +1373,24 @@ def main():
         print("No PDF files found in the boards directory.")
         return
 
+    # Create debug directory
+    debug_dir = os.path.join(output_dir, "debug")
+    if not os.path.exists(debug_dir):
+        os.makedirs(debug_dir)
+        print(f"Created debug directory: {debug_dir}")
+
+    # Set the maximum number of files to process by default
+    max_files = 5  # Only process 5 files by default for quicker testing
+    
     # Process a single PDF file as a test
     example_pdf = os.path.join(input_dir, pdf_files[0])
-    print(f"\nTesting board processing on: {pdf_files[0]}")
+    print(f"\nTesting enhanced board processing on: {pdf_files[0]}")
 
-    # Process the board with hybrid detection
+    # Process the board with hybrid detection and debugging
     fen, squares, piece_grid = process_board_with_hybrid_detection(
-        example_pdf, debug=running_in_notebook
+        example_pdf, 
+        debug=running_in_notebook,
+        output_dir=debug_dir
     )
 
     if fen:
@@ -1083,23 +1407,41 @@ def main():
             fig.savefig(output_file, dpi=150)
             plt.close(fig)
             print(f"Saved visualization to {output_file}")
+            print(f"Detailed debug information saved to {debug_dir}")
         else:
             # In notebook, display the visualization
             visualize_detected_board(squares, piece_grid)
     else:
         print("Failed to process the board.")
 
-    # Ask if user wants to process all files
-    if running_in_notebook or input("\nProcess all PDF files? (y/n): ").lower() == "y":
-        print("\nProcessing all PDF files...")
+    # Ask if user wants to process additional files
+    response = ""
+    if not running_in_notebook:
+        response = input(f"\nProcess additional files? (y/n/all): ").lower()
+    
+    process_all = response == "all"
+    process_some = response == "y" or running_in_notebook
+    
+    if process_all or process_some:
+        print("\nProcessing additional files...")
         results = {}
 
-        for i, pdf_file in enumerate(pdf_files):
+        # Determine number of files to process
+        files_to_process = pdf_files if process_all else pdf_files[:max_files]
+        
+        print(f"Will process {len(files_to_process)} files")
+        
+        for i, pdf_file in enumerate(files_to_process):
             pdf_path = os.path.join(input_dir, pdf_file)
-            print(f"Processing {i+1}/{len(pdf_files)}: {pdf_file}")
+            print(f"Processing {i+1}/{len(files_to_process)}: {pdf_file}")
 
             try:
-                fen, squares, piece_grid = process_board_with_hybrid_detection(pdf_path)
+                # For each board, create a separate debug subfolder
+                pdf_debug_dir = os.path.join(debug_dir, os.path.splitext(pdf_file)[0])
+                
+                fen, squares, piece_grid = process_board_with_hybrid_detection(
+                    pdf_path, output_dir=pdf_debug_dir
+                )
 
                 if fen:
                     # Store results
@@ -1126,6 +1468,8 @@ def main():
                     print(f"Failed to process {pdf_file}")
             except Exception as e:
                 print(f"Error processing {pdf_file}: {e}")
+                import traceback
+                traceback.print_exc()
                 results[pdf_file] = {
                     "error": str(e),
                     "timestamp": datetime.now().isoformat(),
@@ -1138,6 +1482,22 @@ def main():
 
         print(f"\nAll results saved to {output_dir}")
         print(f"Results summary saved to {results_path}")
+        print(f"Detailed debug information saved to {debug_dir}")
+
+        # Provide a summary of processing results
+        success_count = sum(1 for result in results.values() if "fen" in result)
+        error_count = len(results) - success_count
+        
+        print(f"\nProcessing Summary:")
+        print(f"  Total files processed: {len(results)}")
+        print(f"  Successfully processed: {success_count}")
+        print(f"  Failed to process: {error_count}")
+        
+        if error_count > 0:
+            print("\nFiles with errors:")
+            for pdf_file, result in results.items():
+                if "error" in result:
+                    print(f"  - {pdf_file}: {result['error']}")
 
 
 # Run the main function if called directly
@@ -1301,3 +1661,539 @@ class ChessBoardClassifier:
             predictions.append(row_preds)
 
         return predictions
+
+
+def visualize_components(square_img, save_path=None):
+    """
+    Debug function to visualize the connected components analysis.
+    
+    Args:
+        square_img: The square image to analyze
+        save_path: Optional path to save the visualization
+        
+    Returns:
+        Matplotlib figure with visualization
+    """
+    # Convert to grayscale if needed
+    if len(square_img.shape) == 3:
+        gray = cv2.cvtColor(square_img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = square_img.copy()
+    
+    # Apply threshold to get binary image
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    
+    # Crop to center area to minimize grid line interference
+    h, w = binary.shape
+    crop_margin = int(min(h, w) * 0.15)
+    cropped = binary[crop_margin:-crop_margin, crop_margin:-crop_margin]
+    
+    # Use connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cropped)
+    
+    # Create a color image for visualization
+    colors = np.random.randint(0, 255, size=(num_labels, 3), dtype=np.uint8)
+    colors[0] = [0, 0, 0]  # Background is black
+    
+    # Create component visualization
+    components_img = colors[labels]
+    
+    # Create the figure
+    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+    
+    # Original image
+    axs[0, 0].imshow(gray, cmap='gray')
+    axs[0, 0].set_title('Original Square')
+    axs[0, 0].axis('off')
+    
+    # Binary image
+    axs[0, 1].imshow(binary, cmap='gray')
+    axs[0, 1].set_title('Binary Image')
+    axs[0, 1].axis('off')
+    
+    # Cropped binary
+    axs[1, 0].imshow(cropped, cmap='gray')
+    axs[1, 0].set_title('Cropped Binary')
+    axs[1, 0].axis('off')
+    
+    # Colored components
+    axs[1, 1].imshow(components_img)
+    axs[1, 1].set_title(f'Connected Components: {num_labels-1}')
+    
+    # Add component stats
+    for i in range(1, num_labels):
+        x = centroids[i][0]
+        y = centroids[i][1]
+        area = stats[i, cv2.CC_STAT_AREA]
+        width = stats[i, cv2.CC_STAT_WIDTH]
+        height = stats[i, cv2.CC_STAT_HEIGHT]
+        density = area / (width * height) if width * height > 0 else 0
+        
+        axs[1, 1].text(
+            x, y, f"{i}: {area:.0f}\n{width:.0f}x{height:.0f}\nD:{density:.2f}", 
+            color='white', fontsize=8, 
+            bbox=dict(facecolor='black', alpha=0.5)
+        )
+    
+    axs[1, 1].axis('off')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        
+    return fig
+    
+    
+def debug_piece_detection(square_img):
+    """
+    Debug function to show the step-by-step piece detection process.
+    
+    Args:
+        square_img: The square image to analyze
+        
+    Returns:
+        Piece classification and visualization
+    """
+    # Convert to grayscale if not already
+    if len(square_img.shape) == 3:
+        gray = cv2.cvtColor(square_img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = square_img.copy()
+
+    # Apply threshold to get binary image
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # Crop to center area to minimize grid line interference
+    h, w = binary.shape
+    crop_margin = int(min(h, w) * 0.15)
+    cropped = binary[crop_margin:-crop_margin, crop_margin:-crop_margin]
+
+    # Use connected components to find contours
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cropped)
+
+    # If there are no significant components, it's an empty square
+    if num_labels <= 1:
+        return "empty", "No components found"
+
+    # Filter out small noisy components
+    valid_components = []
+    for i in range(1, num_labels):  # Skip background label (0)
+        if stats[i, cv2.CC_STAT_AREA] > 10:  # Lower threshold to catch smaller marks
+            valid_components.append(i)
+
+    if not valid_components:
+        return "empty", "No valid components after filtering"
+
+    # Sort components by area (largest to smallest)
+    valid_components.sort(key=lambda i: stats[i, cv2.CC_STAT_AREA], reverse=True)
+    
+    # Check for subscript 'w' to determine color
+    has_subscript_w = False
+    main_components = []
+    subscript_component = None
+    
+    # Component analysis
+    component_details = []
+    
+    # Find subscript w and main components
+    for i in valid_components:
+        component_top = stats[i, cv2.CC_STAT_TOP]
+        component_height = stats[i, cv2.CC_STAT_HEIGHT]
+        component_bottom = component_top + component_height
+        rel_bottom = component_bottom / cropped.shape[0]
+        
+        # Get component's dimensions
+        comp_width = stats[i, cv2.CC_STAT_WIDTH]
+        comp_height = stats[i, cv2.CC_STAT_HEIGHT]
+        comp_area = stats[i, cv2.CC_STAT_AREA]
+        comp_density = comp_area / (comp_width * comp_height) if comp_width * comp_height > 0 else 0
+        
+        # Record component details
+        component_details.append({
+            "id": i,
+            "area": comp_area,
+            "width": comp_width,
+            "height": comp_height,
+            "top": component_top,
+            "bottom": component_bottom,
+            "rel_bottom": rel_bottom,
+            "density": comp_density,
+            "is_subscript_w": False
+        })
+        
+        # If component is in bottom portion and relatively small, it might be a 'w'
+        if (rel_bottom > 0.7 and 
+            comp_width < cropped.shape[1] / 4 and 
+            comp_height < cropped.shape[0] / 4 and
+            comp_density > 0.4):  # 'w' tends to have good fill ratio
+            has_subscript_w = True
+            subscript_component = i
+            component_details[-1]["is_subscript_w"] = True
+        else:
+            main_components.append(i)
+    
+    # If no main components remain, default to pawn
+    if not main_components:
+        return "P" if has_subscript_w else "p", "No main components, defaulting to pawn"
+    
+    # Use the largest remaining component for piece identification
+    main_component = main_components[0]
+    
+    # Get shape metrics
+    width = stats[main_component, cv2.CC_STAT_WIDTH]
+    height = stats[main_component, cv2.CC_STAT_HEIGHT]
+    area = stats[main_component, cv2.CC_STAT_AREA]
+    aspect = width / height if height > 0 else 1.0
+    
+    # Calculate density (fill ratio)
+    density = area / (width * height) if width * height > 0 else 0
+    
+    # Get relative position
+    left = stats[main_component, cv2.CC_STAT_LEFT]
+    top = stats[main_component, cv2.CC_STAT_TOP]
+    rel_x = (left + width / 2) / cropped.shape[1]  # Relative x center
+    rel_y = (top + height / 2) / cropped.shape[0]  # Relative y center
+    rel_area = area / (cropped.shape[0] * cropped.shape[1])  # Relative area
+    
+    # By default, assume a pawn
+    piece_type = "P"
+    reason = ""
+    
+    # Determine piece type based on shape characteristics
+    if aspect > 1.2:  # Wider than tall
+        if rel_area > 0.2:
+            piece_type = "K"  # Kings tend to be larger and wider
+            reason = f"Wider shape (aspect={aspect:.2f}) with large area (rel_area={rel_area:.2f})"
+        else:
+            piece_type = "R"  # Rooks tend to be wide
+            reason = f"Wider shape (aspect={aspect:.2f}) with moderate area (rel_area={rel_area:.2f})"
+    elif aspect < 0.7:  # Taller than wide
+        if rel_area < 0.06:
+            piece_type = "P"  # Pawns tend to be small and slender
+            reason = f"Tall, slender shape (aspect={aspect:.2f}) with small area (rel_area={rel_area:.2f})"
+        elif density > 0.6:
+            piece_type = "Q"  # Queens often have good fill
+            reason = f"Tall shape (aspect={aspect:.2f}) with high density (density={density:.2f})"
+        else:
+            piece_type = "B"  # Bishops can be tall and thin
+            reason = f"Tall shape (aspect={aspect:.2f}) with moderate density (density={density:.2f})"
+    else:  # Moderate aspect ratio
+        if rel_area > 0.15:
+            if density < 0.5:
+                piece_type = "N"  # Knights have moderate density
+                reason = f"Moderate shape (aspect={aspect:.2f}) with large area (rel_area={rel_area:.2f}) and lower density (density={density:.2f})"
+            else:
+                piece_type = "K"  # Could be a king
+                reason = f"Moderate shape (aspect={aspect:.2f}) with large area (rel_area={rel_area:.2f}) and higher density (density={density:.2f})"
+        elif rel_area < 0.08:
+            piece_type = "P"  # Small pieces are likely pawns
+            reason = f"Moderate shape (aspect={aspect:.2f}) with small area (rel_area={rel_area:.2f})"
+        else:
+            # Look at position and size for more clues
+            if density > 0.6:
+                piece_type = "Q"  # Queens tend to have high density
+                reason = f"Moderate shape (aspect={aspect:.2f}) with high density (density={density:.2f})"
+            elif density < 0.4:
+                piece_type = "N"  # Knights have lower density
+                reason = f"Moderate shape (aspect={aspect:.2f}) with lower density (density={density:.2f})"
+            else:
+                piece_type = "B"  # Default to bishop for moderate values
+                reason = f"Moderate shape (aspect={aspect:.2f}) with moderate density (density={density:.2f})"
+    
+    # Add shape metrics to the reason
+    stats_info = (f"Main component: Area={area}, Size={width}x{height}, "
+                 f"Aspect={aspect:.2f}, Density={density:.2f}, "
+                 f"Rel. Area={rel_area:.2f}, Pos=({rel_x:.2f},{rel_y:.2f})")
+    
+    # Create a detailed analysis
+    analysis = {
+        "num_components": len(valid_components),
+        "has_subscript_w": has_subscript_w,
+        "main_component": main_component,
+        "subscript_component": subscript_component,
+        "metrics": {
+            "aspect": aspect,
+            "density": density,
+            "rel_area": rel_area,
+            "rel_x": rel_x,
+            "rel_y": rel_y
+        },
+        "components": component_details,
+        "reason": reason,
+        "stats": stats_info
+    }
+    
+    # Apply color based on whether we found a subscript 'w'
+    return piece_type if has_subscript_w else piece_type.lower(), analysis
+
+
+def visualize_grid_detection(warped_image, output_path=None):
+    """
+    Visualize the grid line detection process to help with debugging.
+    
+    Args:
+        warped_image: The warped chessboard image
+        output_path: Path to save the visualization (optional)
+        
+    Returns:
+        Visualization figure
+    """
+    height, width = warped_image.shape[:2]
+    
+    # Convert to grayscale if needed
+    if len(warped_image.shape) == 3:
+        gray = cv2.cvtColor(warped_image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = warped_image.copy()
+    
+    # Apply adaptive thresholding to find grid lines
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+    
+    # Use morphology to enhance horizontal and vertical lines
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (width//16, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, height//16))
+    
+    # Detect horizontal lines
+    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+    horizontal_lines = cv2.dilate(horizontal_lines, horizontal_kernel, iterations=1)
+    
+    # Detect vertical lines
+    vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
+    vertical_lines = cv2.dilate(vertical_lines, vertical_kernel, iterations=1)
+    
+    # Combine the lines
+    grid_lines = cv2.bitwise_or(horizontal_lines, vertical_lines)
+    
+    # Function to find the most likely grid line positions
+    def find_grid_lines(lines_image, axis=0):
+        # For horizontal lines, axis=0 (project onto y-axis)
+        # For vertical lines, axis=1 (project onto x-axis)
+        projection = np.sum(lines_image, axis=axis)
+        
+        # Find peaks in the projection (likely grid positions)
+        peak_threshold = np.max(projection) * 0.3  # Adjust threshold as needed
+        peaks = []
+        
+        for i in range(1, len(projection) - 1):
+            if (projection[i] > projection[i-1] and 
+                projection[i] > projection[i+1] and 
+                projection[i] > peak_threshold):
+                peaks.append(i)
+        
+        # If we don't have enough peaks, use regular intervals
+        if len(peaks) < 9:  # We need 9 grid lines (8 cells + boundaries)
+            return np.linspace(0, lines_image.shape[1-axis] - 1, 9).astype(int), projection, []
+        
+        # Sort peaks and select the most prominent ones
+        peaks.sort()
+        original_peaks = peaks.copy()
+        
+        # If too many peaks, select the most evenly spaced ones
+        if len(peaks) > 9:
+            # Start with the first and last peaks (board boundaries)
+            selected_peaks = [peaks[0], peaks[-1]]
+            
+            # Calculate average spacing
+            avg_spacing = (peaks[-1] - peaks[0]) / 8
+            
+            # Try to find peaks at expected positions
+            for i in range(1, 8):
+                expected_pos = peaks[0] + i * avg_spacing
+                best_peak = None
+                min_distance = float('inf')
+                
+                for peak in peaks[1:-1]:  # Skip first and last which we already selected
+                    if peak not in selected_peaks:
+                        distance = abs(peak - expected_pos)
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_peak = peak
+                
+                if best_peak is not None and min_distance < avg_spacing * 0.5:
+                    selected_peaks.append(best_peak)
+            
+            # If we still don't have enough, fill in with evenly spaced positions
+            if len(selected_peaks) < 9:
+                even_spacing = np.linspace(peaks[0], peaks[-1], 9)
+                
+                # Add missing positions
+                for i in range(1, 8):
+                    if i < len(selected_peaks) - 1:
+                        continue
+                    
+                    pos = even_spacing[i]
+                    closest_peak = None
+                    min_dist = float('inf')
+                    
+                    for peak in peaks:
+                        if peak not in selected_peaks:
+                            dist = abs(peak - pos)
+                            if dist < min_dist and dist < avg_spacing * 0.4:
+                                min_dist = dist
+                                closest_peak = peak
+                    
+                    if closest_peak is not None:
+                        selected_peaks.append(closest_peak)
+                    else:
+                        selected_peaks.append(int(pos))
+            
+            # Sort the selected peaks
+            selected_peaks.sort()
+            
+            # Ensure we have exactly 9 peaks
+            if len(selected_peaks) > 9:
+                selected_peaks = selected_peaks[:9]
+            elif len(selected_peaks) < 9:
+                # Fill remaining positions with evenly spaced points
+                missing = 9 - len(selected_peaks)
+                evenly_spaced = np.linspace(selected_peaks[0], selected_peaks[-1], 9)
+                
+                # Find positions that don't have a selected peak nearby
+                for pos in evenly_spaced:
+                    if len(selected_peaks) >= 9:
+                        break
+                    
+                    # Check if this position is not close to any existing peak
+                    if all(abs(pos - peak) > avg_spacing * 0.3 for peak in selected_peaks):
+                        selected_peaks.append(int(pos))
+                
+                # Sort again
+                selected_peaks.sort()
+                
+                # If still not enough, just use evenly spaced positions
+                if len(selected_peaks) < 9:
+                    selected_peaks = np.linspace(selected_peaks[0], selected_peaks[-1], 9).astype(int)
+            
+            return np.array(selected_peaks), projection, original_peaks
+        
+        return np.array(peaks), projection, original_peaks
+    
+    # Get grid line positions
+    row_positions, row_projection, original_row_peaks = find_grid_lines(horizontal_lines, axis=1)
+    col_positions, col_projection, original_col_peaks = find_grid_lines(vertical_lines, axis=0)
+    
+    # Ensure we have exactly 9 positions each (8 squares + boundaries)
+    if len(row_positions) != 9 or len(col_positions) != 9:
+        # Fall back to regular grid if line detection failed
+        row_positions = np.linspace(0, height - 1, 9).astype(int)
+        col_positions = np.linspace(0, width - 1, 9).astype(int)
+    
+    # Visualize the results
+    fig, axs = plt.subplots(3, 3, figsize=(18, 12))
+    
+    # Original image
+    axs[0, 0].imshow(warped_image, cmap='gray' if len(warped_image.shape) == 2 else None)
+    axs[0, 0].set_title('Original Warped Image')
+    axs[0, 0].axis('off')
+    
+    # Thresholded image
+    axs[0, 1].imshow(thresh, cmap='gray')
+    axs[0, 1].set_title('Thresholded Image')
+    axs[0, 1].axis('off')
+    
+    # Horizontal lines
+    axs[0, 2].imshow(horizontal_lines, cmap='gray')
+    axs[0, 2].set_title('Horizontal Lines')
+    axs[0, 2].axis('off')
+    
+    # Vertical lines
+    axs[1, 0].imshow(vertical_lines, cmap='gray')
+    axs[1, 0].set_title('Vertical Lines')
+    axs[1, 0].axis('off')
+    
+    # Combined grid lines
+    axs[1, 1].imshow(grid_lines, cmap='gray')
+    axs[1, 1].set_title('Combined Grid Lines')
+    axs[1, 1].axis('off')
+    
+    # Original image with detected grid lines
+    grid_overlay = warped_image.copy()
+    if len(grid_overlay.shape) == 2:
+        grid_overlay = cv2.cvtColor(grid_overlay, cv2.COLOR_GRAY2RGB)
+    
+    # Draw grid lines
+    for row_pos in row_positions:
+        cv2.line(grid_overlay, (0, row_pos), (width, row_pos), (0, 255, 0), 2)
+    
+    for col_pos in col_positions:
+        cv2.line(grid_overlay, (col_pos, 0), (col_pos, height), (0, 255, 0), 2)
+    
+    axs[1, 2].imshow(grid_overlay)
+    axs[1, 2].set_title('Detected Grid Lines')
+    axs[1, 2].axis('off')
+    
+    # Plot horizontal line projection
+    axs[2, 0].plot(row_projection)
+    axs[2, 0].set_title('Horizontal Line Projection')
+    
+    # Mark detected row positions
+    for pos in row_positions:
+        axs[2, 0].axvline(x=pos, color='g', linestyle='-', alpha=0.5)
+    
+    # Mark original peaks
+    for pos in original_row_peaks:
+        axs[2, 0].axvline(x=pos, color='r', linestyle='--', alpha=0.3)
+    
+    # Plot vertical line projection
+    axs[2, 1].plot(col_projection)
+    axs[2, 1].set_title('Vertical Line Projection')
+    
+    # Mark detected column positions
+    for pos in col_positions:
+        axs[2, 1].axvline(x=pos, color='g', linestyle='-', alpha=0.5)
+    
+    # Mark original peaks
+    for pos in original_col_peaks:
+        axs[2, 1].axvline(x=pos, color='r', linestyle='--', alpha=0.3)
+    
+    # Show segmented squares sample
+    combined_img = np.zeros((400, 400, 3), dtype=np.uint8)
+    
+    # Create an 8x8 grid to store each square
+    squares = []
+    for i in range(8):
+        for j in range(8):
+            # Extract the square using detected grid lines
+            y_start = row_positions[i]
+            y_end = row_positions[i + 1]
+            x_start = col_positions[j]
+            x_end = col_positions[j + 1]
+            
+            # Ensure valid boundaries
+            y_start = max(0, y_start)
+            y_end = min(height, y_end)
+            x_start = max(0, x_start)
+            x_end = min(width, x_end)
+            
+            if y_end > y_start and x_end > x_start:
+                square = warped_image[y_start:y_end, x_start:x_end]
+                # Resize to standardize the square size
+                square = cv2.resize(square, (50, 50))
+                
+                # Copy to the combined image
+                if len(square.shape) == 2:
+                    square_rgb = cv2.cvtColor(square, cv2.COLOR_GRAY2RGB)
+                else:
+                    square_rgb = square.copy()
+                
+                r_start = (i * 50)
+                r_end = ((i + 1) * 50)
+                c_start = (j * 50)
+                c_end = ((j + 1) * 50)
+                
+                if r_end <= 400 and c_end <= 400:
+                    combined_img[r_start:r_end, c_start:c_end] = square_rgb
+    
+    axs[2, 2].imshow(combined_img)
+    axs[2, 2].set_title('Segmented Squares Sample')
+    axs[2, 2].axis('off')
+    
+    plt.tight_layout()
+    
+    if output_path:
+        plt.savefig(output_path, dpi=150)
+    
+    return fig
