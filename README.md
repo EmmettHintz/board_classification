@@ -24,4 +24,4 @@ Work done so far:
        - The pipeline needs to be tuned as a lot of the peices are being put on the borders of the chess board at the moment.
 
 ## Example of Working Board Contour Detection
-![example_board](board1_vis.png)
+![example_board](board_example.png)
