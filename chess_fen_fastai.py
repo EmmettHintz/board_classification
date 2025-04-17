@@ -1,233 +1,275 @@
-# chess_fen_fastai.py
-"""
-End-to-end hand-drawn chessboard → FEN toolkit using fastai.
-
-Commands:
-  • segment:   PDF boards → flat per-cell images + folder skeleton
-  • prepare:   PDF boards + JSON FEN labels → per-class training images
-  • train:     train classifier on per-class images
-  • infer:     classify board PDF/image → FEN
-"""
-import argparse
-import json
+import os
 import cv2
 import numpy as np
 from pathlib import Path
-from fastai.vision.all import *
-from fastai.data.all import get_image_files, parent_label, RandomSplitter
-from fastai.callback.all import SaveModelCallback, EarlyStoppingCallback, MixUp
+import shutil
+import argparse
 from pdf2image import convert_from_path
 
 # ----- Configuration -----
 BOARD_SIZE = 800
-CELL_SIZE = BOARD_SIZE // 8
 CLASS_LABELS = ["empty", "P", "N", "B", "R", "Q", "K", "p", "n", "b", "r", "q", "k"]
 
-# ----- Segmentation Utilities -----
 
-
+# ----- PDF Conversion -----
 def pdf_to_image(path: str, dpi: int = 200) -> np.ndarray:
+    """Convert first page of a PDF to BGR image."""
     pages = convert_from_path(path, dpi=dpi)
-    return cv2.cvtColor(np.array(pages[0]), cv2.COLOR_RGB2BGR)
+    arr = np.array(pages[0])
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def find_board(img: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cnt = max(contours, key=cv2.contourArea)
-    rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect).astype("float32")
-    s, diff = box.sum(axis=1), np.diff(box, axis=1)
-    tl, br = box[np.argmin(s)], box[np.argmax(s)]
-    tr, bl = box[np.argmin(diff)], box[np.argmax(diff)]
+# ----- Preprocessing Utilities -----
+def preprocess_board_image(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Enhance and binarize the input image for robust contour detection.
+    Returns binary mask (closed grid) and CLAHE-enhanced gray.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(blurred)
+    bin_adapt = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+    _, bin_otsu = cv2.threshold(
+        enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    binary = cv2.bitwise_or(bin_adapt, bin_otsu)
+    k_small = np.ones((2, 2), np.uint8)
+    k_large = np.ones((3, 3), np.uint8)
+    denoised = cv2.morphologyEx(binary, cv2.MORPH_OPEN, k_small)
+    dilated = cv2.dilate(denoised, k_large, iterations=1)
+    closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, k_large, iterations=2)
+    return closed, enhanced
+
+
+# ----- Contour & Corner Detection -----
+def find_board_contour(bin_img: np.ndarray) -> np.ndarray:
+    """Find the best 4-point contour approximating the board."""
+    cnts, _ = cv2.findContours(bin_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        raise ValueError("No board contour found")
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+    best, best_score = cnts[0], float("inf")
+    for c in cnts[:5]:
+        area = cv2.contourArea(c)
+        if area < 0.2 * cv2.contourArea(cnts[0]):
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            rect = cv2.minAreaRect(c)
+            box = cv2.boxPoints(rect)
+            rect_area = cv2.contourArea(np.int32(box))
+            score = abs(1 - area / rect_area) + abs(16 - (peri * peri / area)) * 0.1
+            if score < best_score:
+                best_score, best = score, c
+    peri = cv2.arcLength(best, True)
+    approx = cv2.approxPolyDP(best, 0.02 * peri, True)
+    if len(approx) != 4:
+        rect = cv2.minAreaRect(best)
+        approx = cv2.boxPoints(rect)
+    return np.int32(approx)
+
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points: tl, tr, br, bl."""
+    pts = pts.reshape(4, 2)
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1).ravel()
+    tl = pts[np.argmin(s)]
+    br = pts[np.argmax(s)]
+    tr = pts[np.argmin(diff)]
+    bl = pts[np.argmax(diff)]
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
+# ----- Segmentation Pipeline -----
 def warp_and_segment(img: np.ndarray) -> list[list[np.ndarray]]:
-    pts = find_board(img)
-    dst = np.array(
-        [[0, 0], [BOARD_SIZE, 0], [BOARD_SIZE, BOARD_SIZE], [0, BOARD_SIZE]],
-        dtype="float32",
-    )
-    M = cv2.getPerspectiveTransform(pts, dst)
-    warp = cv2.warpPerspective(img, M, (BOARD_SIZE, BOARD_SIZE))
+    """Full pipeline: preprocess → contour → corners → subdivide → refine."""
+    binary, enhanced = preprocess_board_image(img)
+    contour = find_board_contour(binary)
+    quad = order_points(contour)
+    tl, tr, br, bl = quad
+    cell = BOARD_SIZE // 8
     grid = []
     for i in range(8):
         row = []
+        v0, v1 = i / 8.0, (i + 1) / 8.0
         for j in range(8):
-            cell = warp[
-                i * CELL_SIZE : (i + 1) * CELL_SIZE, j * CELL_SIZE : (j + 1) * CELL_SIZE
-            ]
-            row.append(cell)
+            u0, u1 = j / 8.0, (j + 1) / 8.0
+            src = np.vstack(
+                [
+                    (1 - u0) * (1 - v0) * tl
+                    + u0 * (1 - v0) * tr
+                    + u0 * v0 * br
+                    + (1 - u0) * v0 * bl,
+                    (1 - u1) * (1 - v0) * tl
+                    + u1 * (1 - v0) * tr
+                    + u1 * v0 * br
+                    + (1 - u1) * v0 * bl,
+                    (1 - u1) * (1 - v1) * tl
+                    + u1 * (1 - v1) * tr
+                    + u1 * v1 * br
+                    + (1 - u1) * v1 * bl,
+                    (1 - u0) * (1 - v1) * tl
+                    + u0 * (1 - v1) * tr
+                    + u0 * v1 * br
+                    + (1 - u0) * v1 * bl,
+                ]
+            ).astype("float32")
+            dst = np.array(
+                [[0, 0], [cell, 0], [cell, cell], [0, cell]], dtype="float32"
+            )
+            M = cv2.getPerspectiveTransform(src, dst)
+            patch = cv2.warpPerspective(img, M, (cell, cell))
+            patch = refine_cell(patch)
+            row.append(patch)
         grid.append(row)
     return grid
 
 
-# ----- FEN Utilities -----
+# ----- Cell-Level Edge Refinement -----
+def refine_cell(cell: np.ndarray, pad: int = 6) -> np.ndarray:
+    """Crop each cell to its strongest local box via Hough-lines."""
+    h, w = cell.shape[:2]
+    gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 30, 100)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180, threshold=30, minLineLength=w // 3, maxLineGap=5
+    )
+    xs, ys = [], []
+    if lines is not None:
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            if abs(x1 - x2) < 10:
+                xs += [x1, x2]
+            if abs(y1 - y2) < 10:
+                ys += [y1, y2]
+    xs += [0, w]
+    ys += [0, h]
+    x0, x1 = max(min(xs) - pad, 0), min(max(xs) + pad, w)
+    y0, y1 = max(min(ys) - pad, 0), min(max(ys) + pad, h)
+    return cell[y0:y1, x0:x1] if (x1 > x0 and y1 > y0) else cell
 
 
-def fen_to_matrix(fen: str) -> list[list[str]]:
-    rows = fen.split()[0].split("/")
-    mat = []
-    for r in rows:
+# ----- FEN Parsing Functions -----
+def parse_fen_to_board(fen: str) -> list[list[str]]:
+    """
+    Parse a FEN string to a 2D board representation.
+    Returns an 8x8 grid with piece symbols or 'empty'.
+    """
+    ranks = fen.split(" ")[0].split("/")
+    board = []
+
+    for rank in ranks:
         row = []
-        for c in r:
-            if c.isdigit():
-                row += ["empty"] * int(c)
+        for char in rank:
+            if char.isdigit():
+                # Add empty squares
+                row.extend(["empty"] * int(char))
             else:
-                row.append(c)
-        mat.append(row)
-    return mat
+                # Add piece
+                row.append(char)
+        board.append(row)
+
+    return board
 
 
-# ----- CLI Commands -----
+def create_output_structure(output_dir: str):
+    """Create output directory structure for all chess piece types."""
+    base_dir = Path(output_dir)
+    if base_dir.exists():
+        shutil.rmtree(base_dir)
+
+    for label in CLASS_LABELS:
+        (base_dir / label).mkdir(parents=True, exist_ok=True)
+
+    return base_dir
 
 
-def cmd_segment(boards_dir: str, out_dir: str):
-    """Segment all PDFs into flat cell images and create class-folder skeleton."""
+# ----- Auto-Labeling Commands -----
+def cmd_segment_and_label(boards_dir: str, out_dir: str, fen_mapping_file: str):
+    """
+    Segment chess boards and automatically label them based on FEN strings.
+
+    Args:
+        boards_dir: Directory with board PDFs
+        out_dir: Output directory
+        fen_mapping_file: File with board_name,fen_string mappings
+    """
+    # Load FEN mappings
+    fen_mappings = {}
+    with open(fen_mapping_file, "r") as f:
+        for line in f:
+            if line.strip():
+                parts = line.strip().split(",", 1)
+                if len(parts) == 2:
+                    board_name, fen = parts
+                    fen_mappings[board_name] = fen
+
+    if not fen_mappings:
+        print(f"No valid FEN mappings found in {fen_mapping_file}")
+        return
+
+    print(f"Loaded {len(fen_mappings)} FEN mappings")
+
+    # Create output structure
+    output_dir = create_output_structure(out_dir)
+
+    # Process each board
     src = Path(boards_dir)
-    dst = Path(out_dir)
-    allcells = dst / "all_cells"
-    allcells.mkdir(parents=True, exist_ok=True)
+    processed_count = 0
+
     for pdf in src.glob("*.pdf"):
+        board_name = pdf.stem
+
+        # Skip boards without FEN mapping
+        if board_name not in fen_mappings:
+            print(f"Skipping {board_name} (no FEN mapping)")
+            continue
+
+        # Parse FEN to get board state
+        fen = fen_mappings[board_name]
+        board_state = parse_fen_to_board(fen)
+
+        # Segment board into cells
         img = pdf_to_image(str(pdf))
         cells = warp_and_segment(img)
-        for i, row in enumerate(cells):
-            for j, cell in enumerate(row):
-                fname = f"{pdf.stem}_{i}_{j}.png"
-                cv2.imwrite(str(allcells / fname), cell)
-        print(f"Segmented {pdf.name}")
-    # create empty class dirs
-    for split in ["train", "valid"]:
-        for cls in CLASS_LABELS:
-            (dst / split / cls).mkdir(parents=True, exist_ok=True)
-    print(f"Flattened cells -> {allcells} and skeleton under {dst}/train, {dst}/valid.")
 
+        # Save each cell with its label
+        for i, (row_cells, row_labels) in enumerate(zip(cells, board_state)):
+            for j, (cell, label) in enumerate(zip(row_cells, row_labels)):
+                # Save cell to appropriate class directory
+                label_dir = output_dir / label
+                cell_path = label_dir / f"{board_name}_{i}_{j}.png"
+                cv2.imwrite(str(cell_path), cell)
 
-def cmd_prepare(boards_dir: str, labels_json: str, out_dir: str):
-    """Use FEN labels JSON to generate per-class training images."""
-    src = Path(boards_dir)
-    dst = Path(out_dir)
-    dst.mkdir(parents=True, exist_ok=True)
-    with open(labels_json) as f:
-        label_map = json.load(f)
-    for pdf_name, fen in label_map.items():
-        pdf = src / pdf_name
-        if not pdf.exists():
-            continue
-        mat = fen_to_matrix(fen)
-        cells = warp_and_segment(pdf_to_image(str(pdf)))
-        for i in range(8):
-            for j in range(8):
-                lbl = mat[i][j]
-                dest = dst / lbl
-                dest.mkdir(parents=True, exist_ok=True)
-                fname = f"{pdf.stem}_{i}_{j}.png"
-                cv2.imwrite(str(dest / fname), cells[i][j])
-        print(f"Prepared {pdf_name}")
+        processed_count += 1
+        print(f"Processed {board_name} with FEN: {fen}")
 
+    # Count how many images were saved in each directory
+    for label in CLASS_LABELS:
+        dir_path = output_dir / label
+        count = len(list(dir_path.glob("*.png")))
+        print(f"{label}: {count} images")
 
-def get_dls(path: Path, img_size: int = 224, bs: int = 64):
-    dblock = DataBlock(
-        blocks=(ImageBlock, CategoryBlock),
-        get_items=get_image_files,
-        splitter=RandomSplitter(0.2, seed=42),
-        get_y=parent_label,
-        item_tfms=Resize(img_size),
-        batch_tfms=[
-            *aug_transforms(size=img_size),
-            Normalize.from_stats(*imagenet_stats),
-        ],
+    print(f"\nProcessed {processed_count} boards. Images organized by piece type.")
+    print(
+        f"You can now train using: python chess_fen_fastai.py train --data-path {out_dir} --epochs 5"
     )
-    return dblock.dataloaders(path, bs=bs)
-
-
-def cmd_train(data_path: str, epochs: int):
-    """Train piece classifier on per-class images."""
-    dls = get_dls(Path(data_path))
-    learn = vision_learner(dls, models.resnet34, metrics=[accuracy], cbs=[MixUp()])
-    lr, _ = learn.lr_find(suggest_funcs=(minimum,))(0)
-    learn.fine_tune(
-        epochs,
-        base_lr=lr,
-        cbs=[
-            SaveModelCallback(monitor="accuracy", fname="best"),
-            EarlyStoppingCallback(monitor="accuracy", patience=3),
-        ],
-    )
-    learn.export("chess_classifier.pkl")
-    print("Saved chess_classifier.pkl")
-
-
-def cmd_infer(input_path: str, model_path: str):
-    """Infer FEN from a board PDF or image."""
-    img = (
-        pdf_to_image(input_path)
-        if input_path.lower().endswith(".pdf")
-        else cv2.imread(input_path)
-    )
-    cells = warp_and_segment(img)
-    learn = load_learner(model_path).to_fp16()
-    preds = [
-        [
-            str(learn.predict(PILImage.create(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)))[0])
-            for c in row
-        ]
-        for row in cells
-    ]
-    # build FEN
-    fen_r = []
-    for row in preds:
-        f, empty = "", 0
-        for c in row:
-            if c == "empty":
-                empty += 1
-            else:
-                if empty > 0:
-                    f += str(empty)
-                    empty = 0
-                f += c
-        if empty > 0:
-            f += str(empty)
-        fen_r.append(f)
-    fen = "/".join(fen_r) + " w KQkq - 0 1"
-    print("FEN:", fen)
-
-
-# ----- Main -----
-
-
-def main():
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd")
-    seg = sub.add_parser("segment")
-    seg.add_argument("--boards-dir", required=True)
-    seg.add_argument("--out-dir", required=True)
-    prp = sub.add_parser("prepare")
-    prp.add_argument("--boards-dir", required=True)
-    prp.add_argument("--labels-json", required=True)
-    prp.add_argument("--out-dir", required=True)
-    trn = sub.add_parser("train")
-    trn.add_argument("--data-path", required=True)
-    trn.add_argument("--epochs", type=int, default=5)
-    inf = sub.add_parser("infer")
-    inf.add_argument("--input", required=True)
-    inf.add_argument("--model", default="chess_classifier.pkl")
-
-    args = p.parse_args()
-    if args.cmd == "segment":
-        cmd_segment(args.boards_dir, args.out_dir)
-    elif args.cmd == "prepare":
-        cmd_prepare(args.boards_dir, args.labels_json, args.out_dir)
-    elif args.cmd == "train":
-        cmd_train(args.data_path, args.epochs)
-    elif args.cmd == "infer":
-        cmd_infer(args.input, args.model)
-    else:
-        p.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Chess board auto-labeler using FEN notation"
+    )
+    parser.add_argument("--boards-dir", required=True, help="Directory with board PDFs")
+    parser.add_argument("--out-dir", required=True, help="Output directory")
+    parser.add_argument(
+        "--fen-mapping", required=True, help="File with board_name,fen_string mappings"
+    )
+
+    args = parser.parse_args()
+    cmd_segment_and_label(args.boards_dir, args.out_dir, args.fen_mapping)
