@@ -76,7 +76,7 @@ python chess_fen_fastai.py segment --boards-dir ./boards --out-dir ./output --fe
 ```
 
 This will:
-- Load your FEN mappings
+- Load your FEN mappings (labels)
 - Segment each board into 64 individual cells
 - Determine the correct piece label for each cell based on the FEN
 - Save each cell image to the appropriate class directory
