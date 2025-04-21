@@ -5,7 +5,6 @@ evaluate_fen.py
 Standalone evaluation script for the chess FEN prediction pipeline.
 
 Usage:
-    python evaluate_fen.py --boards-dir path/to/boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl [--verbose]
     python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --verbose
 
 Computes exact-match, Levenshtein ratio, ROUGE-1, and square-level accuracy metrics.
@@ -28,16 +27,36 @@ def fen_to_grid(fen: str) -> list[str]:
     Expand FEN "board part" into a flat list of 64 symbols.
     Digits become that many 'empty' entries; letters remain as-is.
     """
+    # Extract just the board part if full FEN is provided
     board = fen.split()[0]
     grid = []
+    
+    # Count how many squares we're creating to help with debugging
+    rank_count = 0
+    
     for rank in board.split('/'):
+        rank_squares = []
         for ch in rank:
             if ch.isdigit():
-                grid.extend(['empty'] * int(ch))
+                rank_squares.extend(['empty'] * int(ch))
             else:
-                grid.append(ch)
+                rank_squares.append(ch)
+        
+        rank_count += 1
+        # Check if this rank has exactly 8 squares
+        if len(rank_squares) != 8:
+            raise ValueError(f"Rank {rank_count} ('{rank}') expands to {len(rank_squares)} squares, expected 8")
+        
+        grid.extend(rank_squares)
+    
+    # Check if we have exactly 8 ranks
+    if rank_count != 8:
+        raise ValueError(f"FEN has {rank_count} ranks, expected 8: '{fen}'")
+    
+    # Final check for total squares
     if len(grid) != 64:
         raise ValueError(f"Expanded FEN has {len(grid)} squares, expected 64: '{fen}'")
+    
     return grid
 
 
@@ -118,6 +137,10 @@ def main():
         "--verbose", action="store_true",
         help="Print per-board predictions and ground truth"
     )
+    parser.add_argument(
+        "--skip-invalid", action="store_true",
+        help="Skip boards with invalid FEN strings instead of failing"
+    )
     args = parser.parse_args()
 
     # Load ground-truth FEN mapping
@@ -129,8 +152,20 @@ def main():
             name, fen = line.strip().split(',', 1)
             fen_map[name.strip()] = fen.strip()
 
+    # Validate all ground truth FEN strings first
+    if not args.skip_invalid:
+        for name, fen in fen_map.items():
+            try:
+                _ = fen_to_grid(fen)
+            except ValueError as e:
+                print(f"Error in ground truth FEN for {name}: {e}")
+                print("Use --skip-invalid to continue anyway, or fix the FEN mapping.")
+                return
+
     preds = []
     truths = []
+    failed = 0
+    skipped = 0
 
     # Iterate boards
     boards_path = Path(args.boards_dir)
@@ -142,7 +177,34 @@ def main():
             continue
 
         true_fen = fen_map[board_name]
+        
+        # Validate the true FEN again
+        try:
+            _ = fen_to_grid(true_fen)
+        except ValueError as e:
+            print(f"Invalid ground truth FEN for {board_name}: {e}")
+            skipped += 1
+            continue
+            
+        # Get prediction
         pred_fen = predict_fen_from_image(str(img_path), args.model)
+        
+        # Handle failed prediction
+        if pred_fen is None:
+            failed += 1
+            if args.verbose:
+                print(f"{board_name} | Prediction FAILED\n            True: {true_fen}\n")
+            continue
+
+        # Validate prediction FEN format
+        try:
+            _ = fen_to_grid(pred_fen)
+        except ValueError as e:
+            failed += 1
+            if args.verbose:
+                print(f"{board_name} | Malformed prediction: {pred_fen}\n            True: {true_fen}\n            Error: {e}")
+            continue
+
         preds.append(pred_fen)
         truths.append(true_fen)
 
@@ -150,10 +212,19 @@ def main():
             print(f"{board_name} | Pred: {pred_fen}\n            True: {true_fen}\n")
 
     # Compute metrics
-    metrics = evaluate_batch(preds, truths)
-    print("\n=== Evaluation Results ===")
-    for k, v in metrics.items():
-        print(f"{k:15}: {v:.4f}")
+    if preds:
+        try:
+            metrics = evaluate_batch(preds, truths)
+            print("\n=== Evaluation Results ===")
+            for k, v in metrics.items():
+                print(f"{k:15}: {v:.4f}")
+        except Exception as e:
+            print(f"Error computing metrics: {e}")
+    else:
+        print("No successful predictions to evaluate.")
+
+    if failed > 0 or skipped > 0:
+        print(f"\n{failed} boards failed prediction, {skipped} boards skipped due to invalid ground truth.")
 
 if __name__ == "__main__":
     main()
