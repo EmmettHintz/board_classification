@@ -10,6 +10,7 @@ Usage:
 Computes exact-match, Levenshtein ratio, ROUGE-1, and square-level accuracy metrics.
 """
 import os
+
 # Enable MPS fallback for MacOS
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
@@ -21,6 +22,7 @@ from collections import Counter
 # Import the prediction function from your pipeline module
 from chess_fen_fastai import predict_fen_from_image
 
+
 # ----- Evaluation Utilities -----
 def fen_to_grid(fen: str) -> list[str]:
     """
@@ -30,37 +32,39 @@ def fen_to_grid(fen: str) -> list[str]:
     # Extract just the board part if full FEN is provided
     board = fen.split()[0]
     grid = []
-    
+
     # Count how many squares we're creating to help with debugging
     rank_count = 0
-    
-    for rank in board.split('/'):
+
+    for rank in board.split("/"):
         rank_squares = []
         for ch in rank:
             if ch.isdigit():
-                rank_squares.extend(['empty'] * int(ch))
+                rank_squares.extend(["empty"] * int(ch))
             else:
                 rank_squares.append(ch)
-        
+
         rank_count += 1
         # Check if this rank has exactly 8 squares
         if len(rank_squares) != 8:
-            raise ValueError(f"Rank {rank_count} ('{rank}') expands to {len(rank_squares)} squares, expected 8")
-        
+            raise ValueError(
+                f"Rank {rank_count} ('{rank}') expands to {len(rank_squares)} squares, expected 8"
+            )
+
         grid.extend(rank_squares)
-    
+
     # Check if we have exactly 8 ranks
     if rank_count != 8:
         raise ValueError(f"FEN has {rank_count} ranks, expected 8: '{fen}'")
-    
+
     # Final check for total squares
     if len(grid) != 64:
         raise ValueError(f"Expanded FEN has {len(grid)} squares, expected 64: '{fen}'")
-    
+
     return grid
 
 
-def rouge1(pred: str, ref: str) -> tuple[float,float,float]:
+def rouge1(pred: str, ref: str) -> tuple[float, float, float]:
     """
     Unigram-overlap ROUGE-1 precision, recall, and F1 on character tokens.
     """
@@ -70,12 +74,12 @@ def rouge1(pred: str, ref: str) -> tuple[float,float,float]:
     rc = Counter(rgrams)
     overlap = sum(min(pc[g], rc[g]) for g in pc)
     prec = overlap / len(pgrams) if pgrams else 0.0
-    rec  = overlap / len(rgrams) if rgrams else 0.0
-    f1   = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    rec = overlap / len(rgrams) if rgrams else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
     return prec, rec, f1
 
 
-def evaluate_batch(preds: list[str], truths: list[str]) -> dict[str,float]:
+def evaluate_batch(preds: list[str], truths: list[str]) -> dict[str, float]:
     """
     Given lists of predicted and true FEN strings, compute:
       - exact_match: fraction exactly equal
@@ -100,7 +104,9 @@ def evaluate_batch(preds: list[str], truths: list[str]) -> dict[str,float]:
         lev_sum += SequenceMatcher(None, p, t).ratio()
         # ROUGE-1
         pr, rc, pf1 = rouge1(p, t)
-        r_prec += pr; r_rec += rc; r_f1 += pf1
+        r_prec += pr
+        r_rec += rc
+        r_f1 += pf1
         # Square-level accuracy
         pg = fen_to_grid(p)
         tg = fen_to_grid(t)
@@ -108,12 +114,12 @@ def evaluate_batch(preds: list[str], truths: list[str]) -> dict[str,float]:
         sq_acc_sum += matches / 64.0
 
     return {
-        'exact_match':     exact / n,
-        'levenshtein_avg': lev_sum / n,
-        'rouge1_prec':     r_prec / n,
-        'rouge1_rec':      r_rec / n,
-        'rouge1_f1':       r_f1 / n,
-        'square_acc':      sq_acc_sum / n,
+        "exact_match": exact / n,
+        "levenshtein_avg": lev_sum / n,
+        "rouge1_prec": r_prec / n,
+        "rouge1_rec": r_rec / n,
+        "rouge1_f1": r_f1 / n,
+        "square_acc": sq_acc_sum / n,
     }
 
 
@@ -122,34 +128,39 @@ def main():
         description="Evaluate FEN predictions against ground-truth mapping"
     )
     parser.add_argument(
-        "--boards-dir", required=True,
-        help="Directory containing board images (PDF/PNG)"
+        "--boards-dir",
+        required=True,
+        help="Directory containing board images (PDF/PNG)",
     )
     parser.add_argument(
-        "--fen-mapping", required=True,
-        help="CSV or text file with lines 'board_name,fen_string'"
+        "--fen-mapping",
+        required=True,
+        help="CSV or text file with lines 'board_name,fen_string'",
     )
     parser.add_argument(
-        "--model", default="models/chess_piece_model.pkl",
-        help="Path to the trained model for prediction"
+        "--model",
+        default="models/chess_piece_model.pkl",
+        help="Path to the trained model for prediction",
     )
     parser.add_argument(
-        "--verbose", action="store_true",
-        help="Print per-board predictions and ground truth"
+        "--verbose",
+        action="store_true",
+        help="Print per-board predictions and ground truth",
     )
     parser.add_argument(
-        "--skip-invalid", action="store_true",
-        help="Skip boards with invalid FEN strings instead of failing"
+        "--skip-invalid",
+        action="store_true",
+        help="Skip boards with invalid FEN strings instead of failing",
     )
     args = parser.parse_args()
 
     # Load ground-truth FEN mapping
-    fen_map: dict[str,str] = {}
-    with open(args.fen_mapping, 'r') as f:
+    fen_map: dict[str, str] = {}
+    with open(args.fen_mapping, "r") as f:
         for line in f:
             if not line.strip():
                 continue
-            name, fen = line.strip().split(',', 1)
+            name, fen = line.strip().split(",", 1)
             fen_map[name.strip()] = fen.strip()
 
     # Validate all ground truth FEN strings first
@@ -169,7 +180,9 @@ def main():
 
     # Iterate boards
     boards_path = Path(args.boards_dir)
-    for img_path in sorted(boards_path.glob("*.pdf")) + sorted(boards_path.glob("*.png")):
+    for img_path in sorted(boards_path.glob("*.pdf")) + sorted(
+        boards_path.glob("*.png")
+    ):
         board_name = img_path.stem
         if board_name not in fen_map:
             if args.verbose:
@@ -177,7 +190,7 @@ def main():
             continue
 
         true_fen = fen_map[board_name]
-        
+
         # Validate the true FEN again
         try:
             _ = fen_to_grid(true_fen)
@@ -185,15 +198,17 @@ def main():
             print(f"Invalid ground truth FEN for {board_name}: {e}")
             skipped += 1
             continue
-            
+
         # Get prediction
         pred_fen = predict_fen_from_image(str(img_path), args.model)
-        
+
         # Handle failed prediction
         if pred_fen is None:
             failed += 1
             if args.verbose:
-                print(f"{board_name} | Prediction FAILED\n            True: {true_fen}\n")
+                print(
+                    f"{board_name} | Prediction FAILED\n            True: {true_fen}\n"
+                )
             continue
 
         # Validate prediction FEN format
@@ -202,7 +217,9 @@ def main():
         except ValueError as e:
             failed += 1
             if args.verbose:
-                print(f"{board_name} | Malformed prediction: {pred_fen}\n            True: {true_fen}\n            Error: {e}")
+                print(
+                    f"{board_name} | Malformed prediction: {pred_fen}\n            True: {true_fen}\n            Error: {e}"
+                )
             continue
 
         preds.append(pred_fen)
@@ -224,7 +241,10 @@ def main():
         print("No successful predictions to evaluate.")
 
     if failed > 0 or skipped > 0:
-        print(f"\n{failed} boards failed prediction, {skipped} boards skipped due to invalid ground truth.")
+        print(
+            f"\n{failed} boards failed prediction, {skipped} boards skipped due to invalid ground truth."
+        )
+
 
 if __name__ == "__main__":
     main()
