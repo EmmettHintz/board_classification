@@ -12,6 +12,9 @@ from pdf2image import convert_from_path
 from fastai.vision.all import *
 from fastai.metrics import error_rate
 import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.colors as mcolors
 
 # ----- Configuration -----
 BOARD_SIZE = 800
@@ -525,11 +528,19 @@ def train_chess_classifier(
     print("\nConfusion Matrix:")
     print(cm)
 
-    # 2. plot it
-    interp.plot_confusion_matrix(figsize=(6, 6), dpi=80)
-
-    # Confusion matrix (just compute, don't display)
+    # 2. plot confusion matrix with log scale
+    plt.figure(figsize=(6, 6), dpi=80)
     cm = interp.confusion_matrix()
+    sns.heatmap(cm, annot=True, fmt='d', cmap='YlOrRd', 
+                xticklabels=learn.dls.vocab,
+                yticklabels=learn.dls.vocab,
+                norm=mcolors.LogNorm())
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Log-scale Confusion Matrix")
+    plt.tight_layout()
+    plt.show()
+
     print(f"Confusion matrix shape: {cm.shape}")
 
     # Save the model

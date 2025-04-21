@@ -10,6 +10,9 @@ Usage:
 Computes exact-match, Levenshtein ratio, ROUGE-1, and square-level accuracy metrics.
 """
 import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.colors as mcolors
 
 # Enable MPS fallback for MacOS
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
