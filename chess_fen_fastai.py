@@ -654,7 +654,7 @@ def generate_fen_from_predictions(predictions):
     board_fen = "/".join(fen_parts)
 
     # For now, just include the board position, assume it's white's turn with full castling rights
-    return f"{board_fen} w KQkq - 0 1"
+    return f"{board_fen}"
 
 
 if __name__ == "__main__":
