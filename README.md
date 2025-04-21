@@ -41,8 +41,8 @@ There are several promising directions for future work. Expanding the dataset wi
 ## Contributions
 
 - Emmett Hintz: Pipeline design, code implementation, and documentation (~30 hours)
-- Tajveer Singh: Dataset Creation (INSERT TIME)
-- Zach Amendola: Dataset Creation & evaluation of the model (INSERT TIME)
+- Tajveer Singh: Dataset creation (INSERT TIME)
+- Zach Amendola: Dataset creation and labeling, & evaluation of the model (~10 hours)
 
 All members contributed to testing and writing of the final report and poster.
 
