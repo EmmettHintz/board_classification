@@ -517,9 +517,18 @@ def train_chess_classifier(
     valid_loss, accuracy = learn.validate()
     print(f"Validation loss: {valid_loss:.4f}")
     print(f"Accuracy: {(1-accuracy):.4f} ({(1-accuracy)*100:.1f}%)")
+    
+    interp = ClassificationInterpretation.from_learner(learn)
+
+    # 1. print raw confusion matrix array
+    cm = interp.confusion_matrix()
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    # 2. plot it
+    interp.plot_confusion_matrix(figsize=(6,6), dpi=80)
 
     # Confusion matrix (just compute, don't display)
-    interp = ClassificationInterpretation.from_learner(learn)
     cm = interp.confusion_matrix()
     print(f"Confusion matrix shape: {cm.shape}")
 
