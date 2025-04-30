@@ -244,7 +244,7 @@ def main():
             output_dir.mkdir(exist_ok=True)
 
             # Add visualization
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(6, 6))
             metrics_to_plot = {
                 k: v
                 for k, v in metrics.items()

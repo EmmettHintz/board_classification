@@ -6,4 +6,4 @@ __pycache__/
 *.pyw
 *.pyz
 output/
-evaluation_output/.DS_Store
+evaluation_output/
