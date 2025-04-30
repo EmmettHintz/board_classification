@@ -8,6 +8,11 @@ Usage:
     python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --verbose
 
 Computes exact-match, Levenshtein ratio, ROUGE-1, and square-level accuracy metrics.
+
+To properly evaluate the model on validation data only:
+1. First, split your data: python chess_fen_fastai.py split --data-path output/
+2. Train on the split: python chess_fen_fastai.py train --data-path output/split --use-split
+3. Evaluate using boards from the validation set (see split output for board names)
 """
 import os
 import matplotlib.pyplot as plt
@@ -126,6 +131,37 @@ def evaluate_batch(preds: list[str], truths: list[str]) -> dict[str, float]:
     }
 
 
+def find_validation_boards(split_path: str) -> set[str]:
+    """
+    Find all board names in the validation set of a split dataset.
+    
+    Args:
+        split_path: Path to the split dataset (containing train/ and valid/ folders)
+        
+    Returns:
+        Set of board names that are in the validation set
+    """
+    valid_path = Path(split_path) / "valid"
+    if not valid_path.exists():
+        return set()
+    
+    # Find all PNG files in any validation class folder
+    valid_boards = set()
+    for class_dir in valid_path.iterdir():
+        if not class_dir.is_dir():
+            continue
+        
+        for img_file in class_dir.glob("*.png"):
+            # Extract board name from filename (format: boardname_i_j.png)
+            parts = img_file.stem.split("_")
+            if len(parts) >= 3:  # Should have at least boardname_i_j
+                # The board name might have underscores, so rejoin everything except the last two parts
+                board_name = "_".join(parts[:-2])
+                valid_boards.add(board_name)
+    
+    return valid_boards
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate FEN predictions against ground-truth mapping"
@@ -155,6 +191,10 @@ def main():
         action="store_true",
         help="Skip boards with invalid FEN strings instead of failing",
     )
+    parser.add_argument(
+        "--split-path",
+        help="Path to split dataset to validate only on validation boards",
+    )
     args = parser.parse_args()
 
     # Load ground-truth FEN mapping
@@ -176,10 +216,20 @@ def main():
                 print("Use --skip-invalid to continue anyway, or fix the FEN mapping.")
                 return
 
+    # If using a split path, find validation boards
+    validation_boards = set()
+    if args.split_path:
+        validation_boards = find_validation_boards(args.split_path)
+        if validation_boards:
+            print(f"Found {len(validation_boards)} boards in validation set")
+        else:
+            print(f"Warning: No validation boards found in {args.split_path}")
+
     preds = []
     truths = []
     failed = 0
     skipped = 0
+    skipped_train = 0
 
     # Iterate boards
     boards_path = Path(args.boards_dir)
@@ -190,6 +240,13 @@ def main():
         if board_name not in fen_map:
             if args.verbose:
                 print(f"Skipping '{board_name}': no ground truth FEN")
+            continue
+
+        # Skip if it's not in the validation set (when using split)
+        if validation_boards and board_name not in validation_boards:
+            skipped_train += 1
+            if args.verbose:
+                print(f"Skipping '{board_name}': not in validation set")
             continue
 
         true_fen = fen_map[board_name]
@@ -278,10 +335,12 @@ def main():
     else:
         print("No successful predictions to evaluate.")
 
-    if failed > 0 or skipped > 0:
+    if failed > 0 or skipped > 0 or skipped_train > 0:
         print(
             f"\n{failed} boards failed prediction, {skipped} boards skipped due to invalid ground truth."
         )
+        if skipped_train > 0:
+            print(f"{skipped_train} boards skipped because they're in the training set.")
 
 
 if __name__ == "__main__":
