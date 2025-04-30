@@ -238,6 +238,41 @@ def main():
             print("\n=== Evaluation Results ===")
             for k, v in metrics.items():
                 print(f"{k:15}: {v:.4f}")
+
+            # Create output directory if it doesn't exist
+            output_dir = Path("evaluation_output")
+            output_dir.mkdir(exist_ok=True)
+
+            # Add visualization
+            plt.figure(figsize=(10, 6))
+            metrics_to_plot = {
+                k: v
+                for k, v in metrics.items()
+                if k != "levenshtein_avg" or k != "rouge1_prec" or k != "rouge1_rec"
+            }
+
+            # Bar chart of metrics with flare color palette
+            ax = sns.barplot(
+                x=list(metrics_to_plot.keys()),
+                y=list(metrics_to_plot.values()),
+                palette="flare",
+            )
+            plt.ylim(0, 1.0)
+
+            plt.title("Model Performance Metrics")
+            plt.ylabel("Score (higher is better)")
+
+            # Put bar labels on interior of bars
+            for i, v in enumerate(metrics_to_plot.values()):
+                ax.text(
+                    i, v / 2, f"{v:.3f}", ha="center", color="white", fontweight="bold"
+                )
+
+            plt.tight_layout()
+            output_path = output_dir / "evaluation_metrics.png"
+
+            plt.savefig(output_path, dpi=300)
+            print(f"Visualization saved as '{output_path}'")
         except Exception as e:
             print(f"Error computing metrics: {e}")
     else:

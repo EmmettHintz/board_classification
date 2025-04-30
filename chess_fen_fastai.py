@@ -529,7 +529,7 @@ def train_chess_classifier(
     print(cm)
 
     # 2. plot confusion matrix with log scale
-    plt.figure(figsize=(6, 6), dpi=80)
+    plt.figure(figsize=(6, 6), dpi=300)
     cm = interp.confusion_matrix()
     sns.heatmap(cm, annot=True, fmt='d', cmap='YlOrRd', 
                 xticklabels=learn.dls.vocab,

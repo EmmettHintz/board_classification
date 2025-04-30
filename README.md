@@ -106,6 +106,19 @@ The output includes:
 - Square-by-square predictions with confidence scores
 - The final FEN notation for the entire board
 
+### 4. Evaluate The Model
+Evaluate the model's performance on a test set:
+
+```bash
+python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --verbose
+```
+
+This will:
+- Load the model and FEN mapping
+- Evaluate the model on the test set
+- Print the accuracy and F1 score
+- Display a bar chart of the model's performance with various metrics
+
 ## FEN Notation Explained
 
 FEN (Forsyth-Edwards Notation) is a standard for describing chess positions:
