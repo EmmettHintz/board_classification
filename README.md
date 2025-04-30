@@ -116,8 +116,12 @@ python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --mode
 This will:
 - Load the model and FEN mapping
 - Evaluate the model on the test set
-- Print the accuracy and F1 score
-- Display a bar chart of the model's performance with various metrics
+- Print various evaluation metrics
+  - Exact match
+  - ROGUE-1 precision, recall, f1
+  - Square-level accuracy
+  - Levenshtein average
+- Display a bar chart of the model's performance on these metrics
 
 ## FEN Notation Explained
 
