@@ -248,7 +248,7 @@ def main():
             metrics_to_plot = {
                 k: v
                 for k, v in metrics.items()
-                if k != "levenshtein_avg" or k != "rouge1_prec" or k != "rouge1_rec"
+                if k != "levenshtein_avg" and k != "rouge1_prec" and k != "rouge1_rec"
             }
 
             # Bar chart of metrics with flare color palette
