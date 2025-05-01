@@ -2,21 +2,24 @@
 
 ## Overview
 
-This project presents an end-to-end pipeline for recognizing chess positions from images of hand-drawn chess boards. Our aim is to automate the process of segmenting a chess board, classifying each square, and reconstructing the board's FEN (Forsyth-Edwards Notation) from a single image. We curated a dataset of 51 hand-drawn chess boards, each labeled with its FEN, and developed a system that segments each board, auto-labels the squares, trains a fastai-based classifier, and accurately predicts FEN for new boards. Our main finding is that with a modest, carefully-labeled dataset, it is possible to train a model that generalizes well to new, hand-drawn chess boards.
+This project presents an end-to-end pipeline for recognizing chess positions from images of hand-drawn chess boards. Our aim is to automate the process of segmenting a chess board, classifying each square, and reconstructing the board's FEN (Forsyth-Edwards Notation) from a single image. We curated a dataset of 95 hand-drawn chess boards, each labeled with its FEN, and developed a system that segments each board, auto-labels the squares, trains a fastai-based classifier, and accurately predicts FEN for new boards. Our main finding is that with a modest, carefully-labeled dataset, it is possible to train a model that generalizes well to new, hand-drawn chess boards.
 
 ## Setup
 
 ### 1. Prerequisites
+
 - Python 3.10 (or 3.8+)
 - [Homebrew](https://brew.sh/) (Mac, recommended)
 
 ### 2. Install Poppler (for PDF processing)
+
 - **Mac:**  
   brew install poppler
 - **Linux:**  
   sudo apt-get install poppler-utils
 
 ### 3. Set Up Python Environment
+
 ```bash
 python3.10 -m venv venv
 source venv/bin/activate  # On Mac/Linux
@@ -24,6 +27,7 @@ venv\Scripts\activate   # On Windows
 ```
 
 ### 4. Install Python Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -77,6 +81,7 @@ python chess_fen_fastai.py segment --boards-dir ./boards --out-dir ./output --fe
 ```
 
 This will:
+
 - Load your FEN mappings (labels)
 - Segment each board into 64 individual cells
 - Determine the correct piece label for each cell based on the FEN
@@ -91,6 +96,7 @@ python chess_fen_fastai.py split --data-path ./output
 ```
 
 This will:
+
 - Create `./output/split/train` and `./output/split/valid` directories
 - Randomly assign 80% of boards to training and 20% to validation
 - Ensure all 64 squares from each board go to the same split
@@ -108,6 +114,7 @@ python chess_fen_fastai.py train --data-path ./output/split --use-split --epochs
 ```
 
 Options:
+
 - `--device cpu` - Force CPU (recommended for M-series Macs with MPS issues)
 - `--batch-size` - Adjust batch size (default: 16)
 - `--arch` - Choose architecture (default: resnet34)
@@ -122,6 +129,7 @@ python chess_fen_fastai.py predict --image path/to/board.pdf
 ```
 
 The output includes:
+
 - Square-by-square predictions with confidence scores
 - The final FEN notation for the entire board
 
@@ -138,6 +146,7 @@ python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --mode
 ```
 
 This will:
+
 - Load the model and FEN mapping
 - Evaluate the model on the test set (or validation set if using `--split-path`)
 - Print various evaluation metrics
@@ -152,6 +161,7 @@ This will:
 Since this implementation does not tune hyperparameters based on validation performance, the validation set effectively serves as a true test set. Therefore:
 
 1. For proper evaluation on unseen data, use:
+
    ```bash
    python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --split-path output/split --verbose
    ```
@@ -178,23 +188,31 @@ Example (starting position): `rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR`
 ## Troubleshooting
 
 ### Apple Silicon (M1/M2/M3) Macs
+
 If you encounter MPS errors on Apple Silicon:
+
 1. The script includes PyTorch MPS fallback: `os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"`
 2. Use `--device cpu` to force CPU if still having issues
 
 ### PDF Conversion Issues
+
 If you encounter PDF conversion issues:
+
 1. Ensure Poppler is installed: `brew install poppler`
 2. Check if the Poppler binaries are in your PATH: `which pdftoppm`
 3. Try reinstalling pdf2image: `pip install --force-reinstall pdf2image`
 
 ### Segmentation Issues
+
 If segmentation is not properly detecting the chess board:
+
 1. Try with a different board PDF
 2. Ensure the board has clear borders and contrast
 
 ### Data Splitting Issues
+
 If you encounter issues with the data splitting:
+
 1. Make sure the segmentation step has completed successfully
 2. Check that your image filenames follow the pattern `boardname_i_j.png`
 3. You may need to create the output directory manually: `mkdir -p output`
