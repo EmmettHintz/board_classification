@@ -8,7 +8,7 @@ This project presents an end-to-end pipeline for recognizing chess positions fro
 
 ### 1. Prerequisites
 
-- Python 3.10 (or 3.8+)
+- Python 3.10
 - [Homebrew](https://brew.sh/) (Mac, recommended)
 
 ### 2. Install Poppler (for PDF processing)
