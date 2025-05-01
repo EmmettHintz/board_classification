@@ -52,10 +52,11 @@ All members contributed to testing and writing of the final report and poster.
 - Automatic labeling based on FEN notation
 - Chess piece classifier training using fastai
 - FEN notation prediction from new chess board images
+- Board-level train/validation splitting for proper evaluation
 
 ## Usage
 
-The main script `chess_fen_fastai.py` provides three primary commands:
+The main script `chess_fen_fastai.py` provides four primary commands:
 
 ### 1. Segment and Label Chess Boards
 
@@ -81,20 +82,38 @@ This will:
 - Determine the correct piece label for each cell based on the FEN
 - Save each cell image to the appropriate class directory
 
-### 2. Train Your Model
+### 2. Split Data for Train/Validation
 
-After segmentation, train your model:
+To ensure proper evaluation, split the segmented data at the board level (not image level):
 
 ```bash
-python chess_fen_fastai.py train --data-path ./output --epochs 5
+python chess_fen_fastai.py split --data-path ./output
+```
+
+This will:
+- Create `./output/split/train` and `./output/split/valid` directories
+- Randomly assign 80% of boards to training and 20% to validation
+- Ensure all 64 squares from each board go to the same split
+- Maintain the same class structure in both splits
+
+You can adjust the validation percentage with `--valid-pct` (default: 0.2).
+
+### 3. Train Your Model
+
+After segmentation and splitting, train your model:
+
+```bash
+# Training with the board-level split (recommended)
+python chess_fen_fastai.py train --data-path ./output/split --use-split --epochs 5
 ```
 
 Options:
 - `--device cpu` - Force CPU (recommended for M-series Macs with MPS issues)
 - `--batch-size` - Adjust batch size (default: 16)
 - `--arch` - Choose architecture (default: resnet34)
+- `--use-split` - Use the existing train/valid directory structure
 
-### 3. Predict FEN Notation
+### 4. Predict FEN Notation
 
 Once trained, predict FEN notation for new chess boards:
 
@@ -106,22 +125,43 @@ The output includes:
 - Square-by-square predictions with confidence scores
 - The final FEN notation for the entire board
 
-### 4. Evaluate The Model
+### 5. Evaluate The Model
+
 Evaluate the model's performance on a test set:
 
 ```bash
+# Evaluate on all boards
 python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --verbose
+
+# OR, evaluate only on validation boards
+python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --split-path output/split --verbose
 ```
 
 This will:
 - Load the model and FEN mapping
-- Evaluate the model on the test set
+- Evaluate the model on the test set (or validation set if using `--split-path`)
 - Print various evaluation metrics
   - Exact match
   - ROGUE-1 precision, recall, f1
   - Square-level accuracy
   - Levenshtein average
 - Display a bar chart of the model's performance on these metrics
+
+#### Note on Test Set Evaluation:
+
+Since this implementation does not tune hyperparameters based on validation performance, the validation set effectively serves as a true test set. Therefore:
+
+1. For proper evaluation on unseen data, use:
+   ```bash
+   python evaluate_fen.py --boards-dir boards/ --fen-mapping fen_mapping.txt --model models/chess_piece_model.pkl --split-path output/split --verbose
+   ```
+
+2. For an even more rigorous evaluation approach, you can:
+   - Set aside some boards before segmentation (e.g., boards 90-95)
+   - Only segment and train on the remaining boards
+   - Evaluate on these completely held-out boards
+
+The first approach is sufficient for most purposes since our training pipeline does not optimize based on validation performance.
 
 ## FEN Notation Explained
 
@@ -152,3 +192,9 @@ If you encounter PDF conversion issues:
 If segmentation is not properly detecting the chess board:
 1. Try with a different board PDF
 2. Ensure the board has clear borders and contrast
+
+### Data Splitting Issues
+If you encounter issues with the data splitting:
+1. Make sure the segmentation step has completed successfully
+2. Check that your image filenames follow the pattern `boardname_i_j.png`
+3. You may need to create the output directory manually: `mkdir -p output`

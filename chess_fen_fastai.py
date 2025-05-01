@@ -15,6 +15,7 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib.colors as mcolors
+import random
 
 # ----- Configuration -----
 BOARD_SIZE = 800
@@ -428,6 +429,136 @@ def cmd_segment_and_label(boards_dir: str, out_dir: str, fen_mapping_file: str):
         print("No boards were processed successfully. Please check the errors above.")
 
 
+# ----- Data Preparation Functions -----
+def split_data_by_board(
+    data_path: str, output_path: str = None, valid_pct: float = 0.2, seed: int = 42
+):
+    """
+    Split data at the board level rather than the image level.
+    
+    Args:
+        data_path: Path to the directory with all class folders
+        output_path: Path for the split output; if None, uses data_path/split
+        valid_pct: Percentage of boards to use for validation (0.0-1.0)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        Path to the split data directory
+    """
+    path = Path(data_path)
+    
+    # Check if the data path exists
+    if not path.exists():
+        print(f"Data path {data_path} does not exist. Checking for alternatives...")
+        
+        # Try to find alternative data paths
+        possible_paths = [
+            Path("./data"),
+            Path("./output"),
+            Path("../output"),
+            Path("../data")
+        ]
+        
+        found = False
+        for alt_path in possible_paths:
+            if alt_path.exists() and any(d.is_dir() for d in alt_path.iterdir()):
+                path = alt_path
+                print(f"Found alternative data path: {path}")
+                found = True
+                break
+        
+        if not found:
+            print(f"No alternative data found. Creating directory structure...")
+            # Make sure the directory exists
+            path.mkdir(parents=True, exist_ok=True)
+            
+            # Create basic class directories for a chess dataset (if they don't exist)
+            # This just ensures the script can continue, but user will need to populate these directories
+            print("Creating basic class directories. You'll need to populate them with images.")
+            for piece_class in CLASS_LABELS:
+                piece_dir = path / piece_class
+                if not piece_dir.exists():
+                    piece_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"Created {piece_dir}")
+    
+    # Get all class directories
+    class_dirs = [d for d in path.iterdir() if d.is_dir() and d.name != "split"]
+    if not class_dirs:
+        print(f"Warning: No class directories found in {path}!")
+        print("Please make sure your data directory has subdirectories for each chess piece type.")
+        print("Expected structure: {data_path}/{piece_type}/{images}")
+        print(f"Expected piece types: {', '.join(CLASS_LABELS)}")
+        print("\nConsider running the segmentation first:")
+        print(f"python chess_fen_fastai.py segment --boards-dir boards/ --out-dir {data_path} --fen-mapping fen_mapping.txt")
+        raise ValueError(f"No class directories found in {data_path}!")
+    
+    print(f"Found {len(class_dirs)} class directories")
+    
+    # Set output path
+    if output_path is None:
+        output_path = path / "split"
+    else:
+        output_path = Path(output_path)
+    
+    # Create output structure
+    train_path = output_path / "train"
+    valid_path = output_path / "valid"
+    
+    # Find all board names by scanning image files
+    all_boards = set()
+    for class_dir in class_dirs:
+        for img_file in class_dir.glob("*.png"):
+            # Extract board name from filename (format: boardname_i_j.png)
+            parts = img_file.stem.split("_")
+            if len(parts) >= 3:  # Should have at least boardname_i_j
+                # The board name might have underscores, so rejoin everything except the last two parts
+                board_name = "_".join(parts[:-2])
+                all_boards.add(board_name)
+    
+    if not all_boards:
+        print(f"Warning: No board images found in {path}!")
+        print("Make sure your directories contain images with the format: boardname_i_j.png")
+        raise ValueError(f"No board images found in {data_path}!")
+    
+    all_boards = sorted(list(all_boards))
+    print(f"Found {len(all_boards)} unique boards")
+    
+    # Split boards into train and validation sets
+    random.seed(seed)
+    random.shuffle(all_boards)
+    split_idx = int(len(all_boards) * (1 - valid_pct))
+    train_boards = set(all_boards[:split_idx])
+    valid_boards = set(all_boards[split_idx:])
+    
+    print(f"Split: {len(train_boards)} boards for training, {len(valid_boards)} boards for validation")
+    
+    # Create the directory structure
+    for class_dir in class_dirs:
+        (train_path / class_dir.name).mkdir(parents=True, exist_ok=True)
+        (valid_path / class_dir.name).mkdir(parents=True, exist_ok=True)
+    
+    # Copy files to the appropriate split directory
+    for class_dir in class_dirs:
+        train_count = valid_count = 0
+        for img_file in class_dir.glob("*.png"):
+            parts = img_file.stem.split("_")
+            if len(parts) >= 3:
+                board_name = "_".join(parts[:-2])
+                if board_name in train_boards:
+                    shutil.copy2(img_file, train_path / class_dir.name / img_file.name)
+                    train_count += 1
+                elif board_name in valid_boards:
+                    shutil.copy2(img_file, valid_path / class_dir.name / img_file.name)
+                    valid_count += 1
+        
+        print(f"Class {class_dir.name}: {train_count} training images, {valid_count} validation images")
+    
+    print(f"\nData split complete. New directory structure created at {output_path}")
+    print(f"You can now train using: python chess_fen_fastai.py train --data-path {output_path} --use-split")
+    
+    return output_path
+
+
 # ----- Training Functions -----
 def train_chess_classifier(
     data_path: str,
@@ -439,6 +570,7 @@ def train_chess_classifier(
     save_model: bool = True,
     output_model: str = "chess_piece_model.pkl",
     device: str = "auto",
+    use_split: bool = False,
 ):
     """
     Train a chess piece classifier using fastai.
@@ -453,6 +585,7 @@ def train_chess_classifier(
         save_model: Whether to save the model
         output_model: Filename to save the model to
         device: Device to use for training ('auto', 'cpu', 'cuda', 'mps')
+        use_split: Whether to use a pre-existing train/valid split in the data path
     """
     print(f"Starting training with {epochs} epochs using {arch}...")
 
@@ -474,18 +607,30 @@ def train_chess_classifier(
     if not path.exists():
         raise ValueError(f"Data path {data_path} does not exist!")
 
-    # Check if directories are present
-    dirs = [d for d in path.iterdir() if d.is_dir()]
-    if not dirs:
-        raise ValueError(f"No class directories found in {data_path}!")
-
-    print(f"Found {len(dirs)} class directories: {[d.name for d in dirs]}")
+    # Choose appropriate splitter based on data organization
+    if use_split:
+        # Check if train/valid subdirectories exist
+        if not (path / "train").exists() or not (path / "valid").exists():
+            raise ValueError(f"Cannot find train/valid directories in {data_path}. Run split_data_by_board first.")
+        print("Using pre-existing train/valid split")
+        splitter = GrandparentSplitter(train_name='train', valid_name='valid')
+        data_path = str(path)
+    else:
+        print("Using random 20% split at the image level")
+        splitter = RandomSplitter(valid_pct=0.2, seed=42)
+        
+        # Check if directories are present
+        dirs = [d for d in path.iterdir() if d.is_dir()]
+        if not dirs:
+            raise ValueError(f"No class directories found in {data_path}!")
+        
+        print(f"Found {len(dirs)} class directories: {[d.name for d in dirs]}")
 
     # Setup DataBlock
     chess_data = DataBlock(
         blocks=(ImageBlock, CategoryBlock),
         get_items=get_image_files,
-        splitter=RandomSplitter(valid_pct=0.2, seed=42),
+        splitter=splitter,
         get_y=parent_label,
         item_tfms=Resize(img_size),
         batch_tfms=[
@@ -539,7 +684,9 @@ def train_chess_classifier(
     plt.ylabel("Actual")
     plt.title("Log-scale Confusion Matrix")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("confusion_matrix.png")
+    plt.close()
+    print("Confusion matrix saved to confusion_matrix.png")
 
     print(f"Confusion matrix shape: {cm.shape}")
 
@@ -689,6 +836,23 @@ if __name__ == "__main__":
         "--fen-mapping", required=True, help="File with board_name,fen_string mappings"
     )
 
+    # Split data command
+    split_parser = subparsers.add_parser(
+        "split", help="Split data by board for train/validation"
+    )
+    split_parser.add_argument(
+        "--data-path", required=True, help="Path to the directory with class folders"
+    )
+    split_parser.add_argument(
+        "--output-path", help="Path for the output split (default: data_path/split)"
+    )
+    split_parser.add_argument(
+        "--valid-pct", type=float, default=0.2, help="Percentage of boards for validation"
+    )
+    split_parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for shuffling"
+    )
+
     # Training command
     train_parser = subparsers.add_parser("train", help="Train a chess piece classifier")
     train_parser.add_argument(
@@ -713,6 +877,11 @@ if __name__ == "__main__":
         default="auto",
         help="Device to use for training ('auto', 'cpu', 'cuda', 'mps')",
     )
+    train_parser.add_argument(
+        "--use-split",
+        action="store_true",
+        help="Use existing train/valid split instead of random split",
+    )
 
     # Prediction command
     predict_parser = subparsers.add_parser(
@@ -732,6 +901,13 @@ if __name__ == "__main__":
     # Execute the appropriate command
     if args.command == "segment":
         cmd_segment_and_label(args.boards_dir, args.out_dir, args.fen_mapping)
+    elif args.command == "split":
+        split_data_by_board(
+            data_path=args.data_path,
+            output_path=args.output_path,
+            valid_pct=args.valid_pct,
+            seed=args.seed,
+        )
     elif args.command == "train":
         train_chess_classifier(
             data_path=args.data_path,
@@ -742,6 +918,7 @@ if __name__ == "__main__":
             arch=args.arch,
             output_model=args.output_model,
             device=args.device,
+            use_split=args.use_split,
         )
     elif args.command == "predict":
         predict_fen_from_image(args.image, args.model)
