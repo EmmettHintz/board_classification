@@ -7,3 +7,4 @@ __pycache__/
 *.pyz
 output/
 evaluation_output/
+.DS_Store
