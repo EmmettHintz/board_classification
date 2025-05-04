@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 ## Data Preparation
 
-- The `boards/` directory contains 51 hand-drawn chess board PDFs (`board1.pdf`, ..., `board51.pdf`).
+- The `boards/` directory contains 95 hand-drawn chess board PDFs (`board1.pdf`, ..., `board95.pdf`).
 - The `fen_mapping.txt` file maps each board to its FEN string.
 - No further data preparation is needed as this is all that is required to segement the board and train the subsequent model using these segmented squares of the chess board.
 
@@ -46,7 +46,7 @@ There are several promising directions for future work. Expanding the dataset wi
 
 - Emmett Hintz: Pipeline design, code implementation, and documentation (~30 hours)
 - Tajveer Singh: Dataset creation and labeling, evaluation metrics (~8 hours)
-- Zach Amendola: Dataset creation and labeling, & evaluation of the model (~10 hours)
+- Zach Amendola: Dataset creation and labeling, & evaluation of the model (~12 hours)
 
 All members contributed to testing and writing of the final report and poster.
 
@@ -72,7 +72,7 @@ board2,rn1qkb1r/pp2pppp/2p2n2/3p4/3P1B2/4Pb1P/PPP2PP1/RN1QKB1R
 ...
 ```
 
-The provided `fen_mapping.txt` already contains mappings for 51 board positions.
+The provided `fen_mapping.txt` already contains mappings for 95 board positions.
 
 Then process the board PDFs:
 
@@ -151,9 +151,9 @@ This will:
 - Evaluate the model on the test set (or validation set if using `--split-path`)
 - Print various evaluation metrics
   - Exact match
+  - Levenshtein average
   - ROGUE-1 precision, recall, f1
   - Square-level accuracy
-  - Levenshtein average
 - Display a bar chart of the model's performance on these metrics
 
 #### Note on Test Set Evaluation:
