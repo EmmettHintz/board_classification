@@ -6,3 +6,6 @@ pdf2image>=1.16.0
 pillow>=8.0.0
 torch>=1.12.0
 fastai>=2.7.0
+tensorflow
+pathlib
+argparse
